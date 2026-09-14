@@ -1,0 +1,49 @@
+# 本地密钥/画像/测试配置——不进 git
+.env
+.env.*
+!.env.example
+persona.local.txt
+cred_guard_local.py
+oc-test-config.json
+*.local.json
+
+# 依赖与缓存
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 日志与备份
+*.log
+*.log.*
+*.bak-*
+*.bak
+*_backup.json
+_backup/
+_import_*.json
+_seed_*.json
+_preset_tools_backup.json
+_wiki_*.json
+_tmp*
+_verify*
+_keep_hashes.json
+_kw3.txt
+*_out.txt
+audit_*_out.txt
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+_wiki_delete_list.txt
+_inspect_ids.py
+_list_all.py
+_patch_verify.py
+_pv.py
+_pv2.py
+_pv3.py
+_pv4.py
+_govern_batch.py
