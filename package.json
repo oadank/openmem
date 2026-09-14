@@ -1,0 +1,16 @@
+{
+  "name": "openmem",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Personal multi-agent memory hub (PostgreSQL + hybrid search + MCP)",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js",
+    "start:http": "node server.js --http 3466"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.76"
+  }
+}
