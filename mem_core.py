@@ -123,6 +123,25 @@ def build_system_prompt(cfg):
 def connect():
     return psycopg2.connect(**PG_CONN)
 
+_UUID_RE = re.compile(r'^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+
+def resolve_entry_id(cur, raw):
+    """id 入口统一解析（2026-09-18 老大拍板）：完整 uuid 直过；≥6 位十六进制短 id
+    按前缀查库——唯一命中自动补全，多义报候选列表，零命中报不存在。
+    与 web_server._resolve_entry_id 同口径，MCP 侧（mh_get/mh_update）不再弹 -32602。"""
+    rid = (raw or '').strip().lower()
+    if _UUID_RE.match(rid):
+        return rid, None
+    if not re.match(r'^[0-9a-f]{6,32}$', rid):
+        return None, 'id 格式不对：传完整 36 位 uuid，或其开头 ≥6 位十六进制短 id: %s' % raw
+    cur.execute("SELECT id::text FROM memory_entries WHERE id::text LIKE %s LIMIT 2", (rid + '%',))
+    rows = [r[0] for r in cur.fetchall()]
+    if len(rows) == 1:
+        return rows[0], None
+    if not rows:
+        return None, 'id 查无此条（短 id 无命中）: %s' % raw
+    return None, '短 id 有歧义（命中多条），请加长前缀或用完整 uuid。候选: %s' % rows
+
 def emb(texts, retries=3):
     payload = {"input": texts, "model": EMBED_MODEL, "encoding_format": "float"}
     for attempt in range(retries):
@@ -625,11 +644,12 @@ def cmd_update(a):
     """
     a.content, _cred_hits = (sanitize_credentials(a.content) if a.content else (None, 0))
     conn = connect(); cur = conn.cursor()
-    cur.execute("SELECT id FROM memory_entries WHERE id=%s", (a.id,))
-    if not cur.fetchone():
+    rid, err = resolve_entry_id(cur, a.id)
+    if err:
         cur.close(); conn.close()
-        out({"ok": False, "error": "id 不存在: %s" % a.id})
+        out({"ok": False, "error": err})
         return
+    a.id = rid
 
     sets, params = [], []
     if a.content is not None:
@@ -902,9 +922,13 @@ def cmd_service(a):
 
 def cmd_get(a):
     conn = connect(); cur = conn.cursor()
+    rid, err = resolve_entry_id(cur, a.id)
+    if err:
+        cur.close(); conn.close()
+        out({"ok": False, "error": err}); return
     cur.execute("""SELECT id, layer, category, source, content, tags, pinned, confidence,
                           created_at, updated_at, superseded_by
-                   FROM memory_entries WHERE id=%s""", (a.id,))
+                   FROM memory_entries WHERE id=%s""", (rid,))
     r = cur.fetchone(); cur.close(); conn.close()
     if not r:
         out({"ok": False, "error": "not found"}); return

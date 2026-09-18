@@ -107,7 +107,7 @@ function createOpenmemServer() {
 
   s.tool('mh_update', '按 id **原地更新**一条记忆（改错字、补内容、转 pinned、换 category 都用这个）。只改传了的字段，未传的保持不动；改了 content 会自动重算向量与 hash。**保留 id**，不打断 superseded_by / 冲突记录引用链——优于"删了重写"。改内容前建议先 mh_get 看一眼原文。',
     {
-      id: z.string().uuid().describe('要更新的条目 id'),
+      id: z.string().regex(/^[0-9a-fA-F][0-9a-fA-F-]{4,34}[0-9a-fA-F]$/).describe('条目 id：完整 36 位 uuid，或 ≥6 位十六进制短 id（唯一前缀服务端自动解析）'),
       content: z.string().min(1).max(20000).optional().describe('新内容（给了就整条替换并重算向量）'),
       layer: z.enum(['k', 'm']).optional(),
       category: z.string().max(100).optional(),
@@ -160,8 +160,8 @@ function createOpenmemServer() {
       } catch (e) { return T(`查服务台账失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_get', '按 id 取单条记忆完整内容。',
-    { id: z.string().uuid() },
+  s.tool('mh_get', '按 id 取单条记忆完整内容。id 可传完整 36 位 uuid 或 ≥6 位短前缀（唯一命中自动解析）。',
+    { id: z.string().regex(/^[0-9a-fA-F][0-9a-fA-F-]{4,34}[0-9a-fA-F]$/).describe('完整 uuid 或 ≥6 位短 id 前缀') },
     async (p) => {
       try { return J(parseCore(await runCore(['get', '--id', p.id]))); }
       catch (e) { return T(`读取失败: ${e.message}`, true); }
