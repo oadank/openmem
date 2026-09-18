@@ -15,6 +15,7 @@
  *   mh_get     按 id 取单条
  *   mh_ask     AI 对 AI 咨询：像问老大本人一样，给完整准确答案（litellm GwV4F）
  *   mh_tool    预生成答案工具：标准化提示词，直接拿最新备好的答案（秒回）
+ *   mh_skill   写入规矩（写入闸门第 1 关的准入入口；默认只给核心版，detail=full 才给手册）
  *   mh_tools_list / mh_status
  */
 
@@ -127,7 +128,7 @@ function createOpenmemServer() {
       } catch (e) { return T(`更新失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_search', '检索老大的统一记忆，返回**原始条目**（适合查历史细节、具体事件、某个坑的完整经过）。混合检索：向量语义 + 元数据过滤(layer/category/source/tags/时间)。⚠️ 但「老大是什么人 / 什么偏好 / 本机环境 / 服务与端口 / 某项目怎么改」这类**标准问题请先试 mh_tools_list → mh_tool**（成品答案，秒回、后台已保鲜），不要直接搜、更不要猜。注意：nssm 服务台账（agent-matrix/services）默认不返回，要查某服务的启动参数/端口用 source="agent-matrix" 显式指定。',
+  s.tool('mh_search', '检索老大的统一记忆，返回**原始条目**（适合查历史细节、具体事件、某个坑的完整经过）。混合检索：向量语义 + 元数据过滤(layer/category/source/tags/时间)。⚠️ 但「老大是什么人 / 什么偏好 / 本机环境 / 服务与端口 / 某项目怎么改」这类**标准问题请先试 mh_tools_list → mh_tool**（成品答案，秒回、后台已保鲜），不要直接搜、更不要猜。注意：nssm 服务台账（agent-matrix/services）默认不返回，要查某服务的启动参数/端口用 source="agent-matrix" 显式指定。🔴 硬规矩：访问 GitHub 或任何需凭据/代理的外部 API 前，必须先在此搜访问方法（如 query="GitHub 凭据"）再动手；报限流/403 先怀疑没走通道，禁止空手重试。',
     {
       query: z.string().min(1).max(2000).describe('查询问题或关键词'),
       layer: z.enum(['k', 'm']).optional(),
@@ -136,12 +137,13 @@ function createOpenmemServer() {
       tags: z.array(z.string()).default([]),
       since: z.string().optional().describe('ISO 日期，如 2026-09-01'),
       top_k: z.number().min(1).max(50).default(10),
-      include_archived: z.boolean().default(false).describe('含已归档旧版本')
+      include_archived: z.boolean().default(false).describe('含已归档旧版本'),
+      requester: z.string().max(100).optional().describe('你自己的 agent 名（留痕治理用，可不填）')
     },
     async (p) => {
       try {
         const a = ['search', '--query', p.query, '--top_k', String(p.top_k),
-          '--tags', (p.tags || []).join(',')];
+          '--tags', (p.tags || []).join(','), '--requester', String(p.requester || 'mcp-client')];
         for (const k of ['layer', 'category', 'source', 'since']) if (p[k]) a.push(`--${k}`, p[k]);
         if (p.include_archived) a.push('--include_archived');
         return J(parseCore(await runCore(a)));
@@ -176,14 +178,31 @@ function createOpenmemServer() {
       } catch (e) { return T(`咨询失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_tool', '【首选 · 秒回】调用预生成答案工具：标准化提示词 + 后台已备好最新最准的答案，**不走 LLM、几乎零等待**。凡「老大是什么人 / 偏好习惯 / 铁律清单 / 本机环境 / 服务与端口 / 12 bot 花名册 / 项目索引 / openmem 使用手册」这类**标准问题一律先用这个**，别用 mh_search 现搜、更别凭印象猜。不知道有哪些成品答案就先调 mh_tools_list（一次看清全部 + 新鲜度）。',
+  s.tool('mh_skill', '【必须先调用】openmem 写入规矩 —— 往 openmem 写记忆（mh_write）前的准入门槛。默认返回**核心写入规矩**（约 800 字符：写入四步 / 三道闸门 / 一句话原则），不走 LLM、秒回；detail="full" 才附完整手册，topic="关键词" 按章节抽段。⚠️ 被写入闸门第 1 关拦下时，调用本工具（**带 agent**）即可放行 —— 不带 agent 不计入你名下、会继续被拦。',
+    {
+      agent: z.string().max(100).optional().describe('你自己的 agent 名（如 claude / codex / mimo / workbuddy）。**必填** —— 闸门靠它记账；不填则第 1 关会继续拦你。'),
+      detail: z.string().optional().describe('full / all / 手册 = 附完整手册 MANUAL.md；默认只给核心规矩'),
+      topic: z.string().optional().describe('按章节标题抽段，如 闸门 / 工具 / Web API')
+    },
+    async (p) => {
+      try {
+        const a = ['skill', '--agent', p.agent || ''];
+        if (p.detail) a.push('--detail', p.detail);
+        if (p.topic) a.push('--topic', p.topic);
+        return J(parseCore(await runCore(a)));
+      } catch (e) { return T(`领规矩失败: ${e.message}`, true); }
+    });
+
+  s.tool('mh_tool', '【首选 · 秒回】调用预生成答案工具：标准化提示词 + 后台已备好最新最准的答案，**不走 LLM、几乎零等待**。凡「老大是什么人 / 偏好习惯 / 铁律清单 / 本机环境 / 服务与端口 / 12 bot 花名册 / 项目索引」这类**标准问题一律先用这个**，别用 mh_search 现搜、更别凭印象猜。不知道有哪些成品答案就先调 mh_tools_list（一次看清全部 + 新鲜度）。⚠️ 写入规矩请用 mh_skill，别在这里领。',
     {
       name: z.string().min(1).describe('工具名，如 主人的喜好'),
+      agent: z.string().max(100).optional().describe('你自己的 agent 名（如 claude / codex / mimo），选填。'),
       force_refresh: z.boolean().default(false).describe('强制重新生成')
     },
     async (p) => {
       try {
         const a = ['tool_call', '--name', p.name];
+        if (p.agent) a.push('--agent', p.agent);
         if (p.force_refresh) a.push('--force_refresh');
         return J(parseCore(await runCore(a, 240000)));
       } catch (e) { return T(`工具调用失败: ${e.message}`, true); }

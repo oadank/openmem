@@ -2,8 +2,12 @@
 # -*- coding: utf-8 -*-
 """openmem 记忆导入：WorkBuddy 记忆 + agents-memory
 
-2026-09-12：wiki vault 与 agentmemory 已整体下线（内容已全量并入 openmem），
-本脚本不再从它们导入；只保留本地 markdown 来源的增量同步。
+🔴 2026-09-18 起**默认停用**（老大拍板，见 main() 开头的说明）：
+   openmem 已是唯一记忆真源，本地 md 文件只留规矩骨架 + 路标。
+   把整份文件倒进库 = 在库里堆「文件影子」，必然与文件重复、随文件漂移。
+   各 agent 的结论一律用 mh_write 手写进库。确需回灌历史文件才加 --legacy。
+
+2026-09-12：wiki vault 与 agentmemory 已整体下线（内容已全量并入 openmem）。
 """
 import sys, os, json, hashlib
 from datetime import datetime
@@ -64,6 +68,17 @@ def md_items(root: Path, source, layer, cat_fn, skip_dirs=None, skip_files=()):
     return items
 
 def main():
+    # ── 🔴 2026-09-18 起默认停用「整篇倒文件」（老大拍板）───────────────
+    # 原因：openmem 已是唯一记忆真源，本地 md 只留规矩骨架 + 路标。
+    # 整篇倒文件 = 在库里堆「文件影子」，必然与文件重复、随文件漂移，
+    # 且每次同步都把这些脏条目再灌一遍（删了还会回来）。
+    # 2026-09-18 已清理 23 条此类影子条目（source=workbuddy, category=archive）。
+    # 各 agent 的结论一律用 mh_write 手写进库；确需回灌历史文件才显式加 --legacy。
+    if "--legacy" not in sys.argv:
+        print("已停用文件同步（默认）。openmem 是唯一真源，结论请用 mh_write 写库。")
+        print("确需回灌历史文件：python import_sources.py --legacy")
+        return
+
     # 1. WorkBuddy 记忆（用户级 + 工作区日志）→ m 层
     wb_items = []
     for f in sorted(WB_USER.glob("*.md")):

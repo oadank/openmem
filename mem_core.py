@@ -255,27 +255,74 @@ def do_ask_stream(query, requester, history=None, session_id=None, extra_context
 #   旧版用全库共享的 last_handbook_at / last_search_at 判定，是图省 token 的错误折中，已废。
 
 GATE_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gate_state.json")
-GATE_SKILL_HOURS = 24     # 规矩有效期（小时）——按 agent 各自算
+GATE_SKILL_HOURS = 12     # 规矩有效期（小时）——按 agent 各自算（2026-09-18：24 → 12）
 GATE_SEARCH_MIN = 30      # 查重时间窗（分钟）——按 agent 各自算
 GATE_GRACE_DAYS = 7       # 被拦一次后的豁免期（安全阀）
 GATE_DUP_HI = 0.95        # 相似度红线：≥ 视为重复
 GATE_DUP_SHOW = 3         # 回显相似条数
-GATE_HANDBOOK = "openmem 使用手册"
 
-GATE_RULES = """【你是 openmem 的共建者，不是过客 —— 不能只拉屎不擦屁股】
+# ── 规矩 vs 手册：两回事，别再绑在一起（2026-09-18 老大骂醒）──────────
+# 规矩 = 准入条文，精简（RULES.md ≈ 700 字符 ≈ 500 token）—— 闸门要的是"领它这个动作"
+# 手册 = 完整说明书（MANUAL.md ≈ 11491 字符 ≈ 7117 token）—— 按需查的参考资料，不是准入条件
+GATE_SKILL_TOOL = "openmem 写入规矩"     # 兼容老路（mh_tool 的名字）；新路 = 独立工具 mh_skill
+GATE_SKILL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "RULES.md")
+GATE_MANUAL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MANUAL.md")
+GATE_HANDBOOK = "openmem 使用手册"       # 完整手册（不参与闸门判定）
 
-写入前四步（2026-09-18 定死）：
-1) 先搜：mh_search(关键词, requester="<你的 agent 名>")，再换 1~2 个近义词搜一遍 —— 库里可能已经有了
-2) 有则原地改：mh_update(id, content=…) —— 保留 id、不新增
-3) 无则新增：确认真的没有，才 mh_write
-4) 同主题只维护一条「活条目」：版本 / 状态变了就 update 那一条，禁止一版一条流水账
+# 🔴 2026-09-18 老大拍板重做（照 win-desktop-helper 的 get_skill 模式）：
+#   win 那边是：独立工具 get_skill（描述自带【必须先调用】）+ 默认只给核心版 +
+#   detail="full" 才给完整 + topic="关键词" 按标题抽段 + 拦下只说一句「去调 get_skill」。
+#   我照抄，只改两点（openmem 与它不同）：
+#     ① 它拦「所有工具」，openmem 只拦 mh_write —— 读操作零污染，拦读纯粹招骂。
+#     ② 它把状态放进程内布尔（每个 bridge 进程一份 → 天然「每会话归零」）；
+#        openmem 是无状态 HTTP（server.js 写死 sessionIdGenerator: undefined，拿不到会话 id），
+#        只能用「每 agent 每 GATE_SKILL_HOURS 小时重领一次」近似。键就是 mh_write 本来就有的 source。
 
-错的直接删（不搞归档）：
-  curl -X DELETE "http://127.0.0.1:3467/api/entry?id=<uuid>"
 
-🔴 规矩是「你自己」的责任，不是集体荣誉：别的 agent 读过 / 搜过，不代表你可以跳过。
-本返回体里就是规矩全文 —— 看完直接**再调用一次 mh_write** 即可放行，不用去别处领。
-（手册全文是按需查的参考资料，不是准入条件：mh_tool(name="openmem 使用手册")）"""
+def gate_rules_text():
+    """规矩真源 = RULES.md（走本地文件，不经 AI 生成、可版本控制）"""
+    try:
+        with open(GATE_SKILL_FILE, encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return ("# openmem 写入规矩（RULES.md 读取失败：%s）\n\n"
+                "① 先搜（mh_search，带 requester）→ ② 有则 mh_update → ③ 无则 mh_write → "
+                "④ 同主题只维护一条活条目。错的直接删，不搞归档。" % e)
+
+# 规矩正文已外置到 RULES.md（由 gate_rules_text() 读取）—— 2026-09-18 老大纠正：
+# 闸门要的是"领规矩"这个动作，不是把 7117 token 的手册全文塞回上下文。
+# 拦截返回体里不再附规矩正文，只留一句话提示「去调 mh_skill」。
+
+
+def gate_skill_text(detail="", topic=""):
+    """mh_skill 的正文（2026-09-18 老大拍板重做）。
+
+    照 win-desktop-helper 的 get_skill：**默认永远不是全量**。
+      · 默认        → 核心规矩（RULES.md，≈1600 字符 / ≈500 token）
+      · detail=full → 核心规矩 + 完整手册（MANUAL.md）
+      · topic=xxx   → 在规矩 + 手册里按 `#` 标题抽段
+    """
+    core = gate_rules_text()
+    topic = (topic or "").strip()
+    if topic:
+        blob = core
+        try:
+            with open(GATE_MANUAL_FILE, encoding="utf-8") as f:
+                blob += "\n\n" + f.read()
+        except Exception:
+            pass
+        segs = re.split(r"(?m)^(?=#{1,3} )", blob)
+        hit = [s for s in segs if topic.lower() in s.split("\n", 1)[0].lower()]
+        if hit:
+            return "\n\n".join(h.strip() for h in hit)
+        return core + "\n\n（topic「%s」在规矩/手册里没找到对应章节；以上是规矩全文。）" % topic
+    if (detail or "").strip().lower() in ("full", "all", "手册", "全文"):
+        try:
+            with open(GATE_MANUAL_FILE, encoding="utf-8") as f:
+                return core + "\n\n" + ("=" * 30) + "\n\n" + f.read()
+        except Exception as e:
+            return core + "\n\n（完整手册读取失败：%s）" % e
+    return core
 
 
 def _gate_load():
@@ -324,19 +371,31 @@ def gate_mark_search(requester):
     _gate_save(st)
 
 
-def gate_mark_handbook(tool_name):
-    """mh_tool 取到「openmem 使用手册」→ 记一笔「有人领过手册」（**仅统计**）
+def gate_mark_skill(agent):
+    """领到写入规矩 → 记到**你自己**名下（①关唯一的放行依据）
 
-    🔴 不参与放行判定（2026-09-18 老大纠正）：规矩按 agent 各自算，不能集体荣誉。
-    放行只看 ag["rules_taught_at"]（= 你自己那次被拦时拿到的规矩全文）。
-    这里之所以仍只记全库时间戳：mh_tool 的入参没有 agent 身份（server.js schema 只有 name）。
+    2026-09-18 老大拍板重做：规矩做成**独立工具 mh_skill**（描述自带【必须先调用】），
+    闸门拦下只说一句「去调 mh_skill」—— 不再把它塞进 mh_tool(name="…") 的一个字符串参数里
+    （那样工具清单里根本看不出"该领规矩了"，还得记住一个字符串）。
+    必须带 agent：没报名字 = 记不到任何人头上 = 不算数。
     """
-    if not tool_name or GATE_HANDBOOK not in str(tool_name):
+    a = (agent or "").strip()
+    if not a or a in ("unknown", "unknown-agent", "mcp-client"):
         return False
     st = _gate_load()
-    st["last_handbook_at"] = time.time()
+    ag = _gate_ag(st, a)
+    ag["rules_taught_at"] = time.time()
+    ag["rules_taught_count"] = ag.get("rules_taught_count", 0) + 1
+    st["last_skill_at"] = time.time()      # 仅统计
     _gate_save(st)
     return True
+
+
+def gate_mark_handbook(tool_name, agent=""):
+    """兼容老路：mh_tool(name="openmem 写入规矩") 也算领规矩（新路 = mh_skill）"""
+    if not tool_name or GATE_SKILL_TOOL not in str(tool_name):
+        return False
+    return gate_mark_skill(agent)
 
 
 def _gate_denied(ag, kind, now):
@@ -360,24 +419,22 @@ def gate_check_write(source):
     now = time.time()
     ag = _gate_ag(st, source)
 
-    # ① 规矩闸门：你自己 24h 内没被教过规矩 → 拦
-    #    拦下的这一瞬间，规矩全文就在返回体里（= 已送达）；下次再写即放行。
+    # ① 规矩闸门：你自己没领过写入规矩 → 拦
+    #    🔴 **不设豁免**（2026-09-18 老大定）：这是准入门槛，必须真去领，领完再写才放行。
+    #    规矩很短（RULES.md ≈ 500 token），不是那份完整手册。
     if now - ag.get("rules_taught_at", 0) > GATE_SKILL_HOURS * 3600:
-        if not _gate_denied(ag, "skill", now):
-            ag["rules_taught_at"] = now
-            _gate_exempt(ag, "skill", now)
-            _gate_save(st)
-            return {
-                "ok": False, "gate": "rules", "denied": True,
-                "reason": "写入被拦（第 1 关 / 共 3 关）：你（%s）24h 内还没读过写入规矩就下笔了。" % source,
-                "how_to_pass": "规矩全文就在下面这个 rules 字段里（本返回体）。看完直接**再调用一次 mh_write** 即可放行，不用去别处领。",
-                "note": "本关按 agent 各自记账、各自只拦一次（拦过豁免 7 天）—— 别的 agent 读过规矩，不代表你可以跳过。",
-                "rules": GATE_RULES,
-            }
-        ag["skill_skipped"] = True
+        ag["skill_denied"] = ag.get("skill_denied", 0) + 1
         _gate_save(st)
+        return {
+            "ok": False, "gate": "rules", "denied": True,
+            "reason": "写入被拦（第 1 关 / 共 3 关）：你（%s）还没领过 openmem 写入规矩。" % source,
+            "how_to_pass": '调用 mh_skill(agent="%s") —— 它就在你的工具清单里、无需别的参数，'
+                           '几秒返回（就是给你规矩，不是那份完整手册）。拿到后直接再写一次即可放行。' % source,
+            "note": "本关每 %d 小时领一次，领过即放行。规矩是每个 agent 各自的义务 —— "
+                    "别人领过，不代表你可以跳过。" % GATE_SKILL_HOURS,
+        }
 
-    # ② 查重闸门：你自己 30min 内没搜过库 → 拦
+    # ② 查重闸门：你自己 30min 内没搜过库 → 拦（带安全阀：拦一次豁免 7 天）
     if (now - ag.get("searched_at", 0)) > GATE_SEARCH_MIN * 60:
         if not _gate_denied(ag, "search", now):
             _gate_exempt(ag, "search", now)
@@ -388,7 +445,6 @@ def gate_check_write(source):
                 "how_to_pass": '先 mh_search(<你这条的关键词>, requester="%s")，'
                                '**必须带上 requester 才记得到你名下**；看完结果再写一次即可放行。' % source,
                 "note": "本关按 agent 各自记账、各自只拦一次（拦过豁免 7 天）。",
-                "rules": GATE_RULES,
             }
         ag["search_skipped"] = True
     _gate_save(st)
@@ -429,11 +485,10 @@ def gate_check_dup(cur, source, emb_vec, content):
     _gate_save(st)
     return {
         "ok": False, "gate": "dup", "denied": True,
-        "reason": "写入被拦（第 3 关 / 共 3 关）：这条与库里已有条目相似度 %.2f，基本是同一件事。" % near[0]["score"],
+        "reason": "写入被拦（第 3 关）：与库里已有条目相似度 %.2f，基本是同一件事。" % near[0]["score"],
         "similar": near,
-        "how_to_pass": "正确做法是擦屁股：mh_update(id=\"%s\", content=\"<合并后的最新版>\")。" % near[0]["id"],
-        "note": "若确实不是一回事（只是话题相近），把内容写得更具体再提交一次即可放行。",
-        "rules": GATE_RULES,
+        "how_to_pass": '改用 mh_update(id="%s", content="<合并后的最新版>")。' % near[0]["id"],
+        "note": "确实不是一回事，就把内容写得更具体再交一次。",
     }
 
 
@@ -481,6 +536,32 @@ def cmd_write(a):
             res["tip"] = ("注意：库里已有相似度 %.2f 的条目（%s）。若属同主题，请改用 "
                           'mh_update(id="%s", content="<合并后的最新版>")，别再堆第二条。'
                           % (similar[0]["score"], similar[0]["id"], similar[0]["id"]))
+    out(res)
+
+
+def cmd_skill(a):
+    """领 openmem 写入规矩（独立工具；照 win-desktop-helper 的 get_skill 模式）。
+
+    2026-09-18 老大拍板重做。规则：
+    · 默认只给**核心规矩**（RULES.md）；detail="full" 才附完整手册；topic="关键词" 按标题抽段。
+      —— 照 win 的 get_skill「默认永远不是全量」。
+    · **必须带 agent**：领到即记账，这是写入闸门第 1 关唯一的放行依据。
+    · openmem 是无状态 HTTP（没有 session 概念），所以「每会话归零」用
+      「每 agent 每 GATE_SKILL_HOURS 小时重领一次」近似。
+    """
+    ag = (getattr(a, "agent", "") or "").strip()
+    txt = gate_skill_text(getattr(a, "detail", ""), getattr(a, "topic", ""))
+    counted = False
+    try:
+        counted = gate_mark_skill(ag)
+    except Exception:
+        pass
+    res = {"ok": True, "skill": txt, "chars": len(txt),
+           "counted_for": ag if counted else None,
+           "next": "拿到规矩后，直接再调用一次 mh_write 即可放行。"}
+    if not counted:
+        res["warn"] = ('没带 agent（或名字无效）→ 本次领规矩**不计入**任何人名下，'
+                       '第 1 关仍会拦你。请带 agent="<你的 agent 名>" 再调一次。')
     out(res)
 
 
@@ -857,6 +938,26 @@ def generate_tool_answer(tool_name, prompt_template):
     return answer, refs
 
 def cmd_tool_call(a):
+    agent = (getattr(a, "agent", "") or "").strip()
+
+    # ── 领规矩（真源 RULES.md，本地文件直读：不走 AI 生成、不动库）────────────
+    # 2026-09-18 老大定：闸门要的是「领规矩」这个动作 —— 规矩是精简准入条文，
+    # 不是 MANUAL.md 那份 11491 字符的完整手册（手册按需查，不参与闸门）。
+    if GATE_SKILL_TOOL in (a.name or ""):
+        ok = False
+        try:
+            ok = gate_mark_handbook(a.name, agent)
+        except Exception:
+            pass
+        res = {"ok": True, "name": GATE_SKILL_TOOL, "answer": gate_rules_text(),
+               "cached": True, "from_file": os.path.basename(GATE_SKILL_FILE),
+               "counted_for": agent if ok else None}
+        if not ok:
+            res["warn"] = ('未提供 agent，本次**不计入**你的领规矩记录 —— 带上 '
+                           'agent="<你的 agent 名>" 再调一次，否则第 1 关会继续拦你。')
+        out(res)
+        return
+
     conn = connect(); cur = conn.cursor()
     cur.execute("""SELECT id, name, prompt_template, cached_answer, answer_updated_at, refresh_interval
                    FROM preset_tools WHERE name=%s AND enabled""", (a.name,))
@@ -865,11 +966,6 @@ def cmd_tool_call(a):
         cur.close(); conn.close()
         out({"ok": False, "error": f"工具不存在: {a.name}"}); return
     tid, name, tmpl, cached, updated_at, interval = r
-    # 领规矩留痕（2026-09-18）：取到「openmem 使用手册」= 已读写入规矩 → 规矩闸门放行
-    try:
-        gate_mark_handbook(name)
-    except Exception:
-        pass
     fresh = False
     if cached and updated_at and interval:
         from datetime import timedelta
@@ -1033,7 +1129,7 @@ def cmd_gate(a):
          "now": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
          "_note": "下面两个 last_* 只是全库统计，不参与任何闸门判定（判定一律看 agents 里各自的时刻）",
          "stats_only": {
-             "last_handbook": _ago(st.get("last_handbook_at")),
+             "last_skill": _ago(st.get("last_skill_at") or st.get("last_handbook_at")),
              "last_search_any": _ago(st.get("last_search_at"))},
          "params": {"skill_hours": GATE_SKILL_HOURS, "search_min": GATE_SEARCH_MIN,
                     "grace_days": GATE_GRACE_DAYS, "dup_hi": GATE_DUP_HI},
@@ -1103,8 +1199,15 @@ def main():
     k.set_defaults(func=cmd_ask)
 
     t = sub.add_parser("tool_call"); t.add_argument("--name", required=True)
+    t.add_argument("--agent", default="", help="领规矩留痕用：你自己的 agent 名")
     t.add_argument("--force_refresh", action="store_true")
     t.set_defaults(func=cmd_tool_call)
+
+    sk = sub.add_parser("skill")   # 独立工具 mh_skill（2026-09-18 老大拍板重做）
+    sk.add_argument("--agent", default="", help="你自己的 agent 名 —— 写入闸门第 1 关靠它放行")
+    sk.add_argument("--detail", default="", help='full = 附完整手册；默认只给核心规矩')
+    sk.add_argument("--topic", default="", help="按章节标题抽段，如 闸门 / 工具 / Web API")
+    sk.set_defaults(func=cmd_skill)
 
     tc = sub.add_parser("tool_create")
     tc.add_argument("--name", required=True); tc.add_argument("--prompt", required=True)
