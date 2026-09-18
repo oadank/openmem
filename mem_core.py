@@ -239,19 +239,24 @@ def do_ask_stream(query, requester, history=None, session_id=None, extra_context
 
 # ── 写入闸门（2026-09-18 老大拍板）─────────────────────────
 # 信念：全体 agent 都是 openmem 的共建者 —— 不能只拉屎不擦屁股。
-#   ① 规矩闸门：24h 内没人领过手册 → 拦一次，把「写入四步」甩回它上下文
-#   ② 查重闸门：本 agent（或全库）最近没人搜过 → 拦一次，逼它先 mh_search
+#   ① 规矩闸门：**你自己** 24h 内没被教过规矩 → 拦一次，规矩全文随返回体送达
+#   ② 查重闸门：**你自己** 30min 内没搜过库 → 拦一次，逼它先 mh_search
 #   ③ 重复闸门：要写的这条库里已有 ≥GATE_DUP_HI 相似度 → 拦，逼它去 mh_update
 #      + 放行时回显最像的 N 条，把"重复证据"直接拍它脸上
 # 安全阀：每 source 每类闸门只拦一次，拦过豁免 GATE_GRACE_DAYS 天
 #         （宁可少拦，不能卡死写入 —— 写入被卡 = 记忆丢失，比污染更糟）。
 # 只拦 mh_write（新增）；mh_update 一律放行 —— 那正是我们鼓励的"擦屁股"动作。
 # 改本文件立即生效（MCP 每次调用 spawn 新 Python，无需重启服务）。
+#
+# 🔴 2026-09-18 老大纠正（重要，别改回去）：
+#   ①② 必须**按 agent 各自记账**。规矩是每个 agent 自己的责任，不是集体荣誉 ——
+#   「codex 领过规矩，所以 claude 可以随便写」是错的，等于①关退化成"每天随机抽一个
+#   倒霉蛋去学规矩、其余人免考"。查重同理：别人搜过库 ≠ 你搜过。
+#   旧版用全库共享的 last_handbook_at / last_search_at 判定，是图省 token 的错误折中，已废。
 
 GATE_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gate_state.json")
-GATE_SKILL_HOURS = 24     # 规矩有效期（小时）
-GATE_SEARCH_MIN = 30      # 查重时间窗（分钟）
-GATE_SEARCH_ANY_MIN = 5   # 兜底：全库任意人搜过也算（多数 agent 不填 requester）
+GATE_SKILL_HOURS = 24     # 规矩有效期（小时）——按 agent 各自算
+GATE_SEARCH_MIN = 30      # 查重时间窗（分钟）——按 agent 各自算
 GATE_GRACE_DAYS = 7       # 被拦一次后的豁免期（安全阀）
 GATE_DUP_HI = 0.95        # 相似度红线：≥ 视为重复
 GATE_DUP_SHOW = 3         # 回显相似条数
@@ -260,7 +265,7 @@ GATE_HANDBOOK = "openmem 使用手册"
 GATE_RULES = """【你是 openmem 的共建者，不是过客 —— 不能只拉屎不擦屁股】
 
 写入前四步（2026-09-18 定死）：
-1) 先搜：mh_search(关键词)，再换 1~2 个近义词搜一遍 —— 库里可能已经有了
+1) 先搜：mh_search(关键词, requester="<你的 agent 名>")，再换 1~2 个近义词搜一遍 —— 库里可能已经有了
 2) 有则原地改：mh_update(id, content=…) —— 保留 id、不新增
 3) 无则新增：确认真的没有，才 mh_write
 4) 同主题只维护一条「活条目」：版本 / 状态变了就 update 那一条，禁止一版一条流水账
@@ -268,7 +273,9 @@ GATE_RULES = """【你是 openmem 的共建者，不是过客 —— 不能只�
 错的直接删（不搞归档）：
   curl -X DELETE "http://127.0.0.1:3467/api/entry?id=<uuid>"
 
-规矩全文：mh_tool(name="openmem 使用手册")"""
+🔴 规矩是「你自己」的责任，不是集体荣誉：别的 agent 读过 / 搜过，不代表你可以跳过。
+本返回体里就是规矩全文 —— 看完直接**再调用一次 mh_write** 即可放行，不用去别处领。
+（手册全文是按需查的参考资料，不是准入条件：mh_tool(name="openmem 使用手册")）"""
 
 
 def _gate_load():
@@ -300,18 +307,30 @@ def _gate_ag(st, source):
 
 
 def gate_mark_search(requester):
-    """mh_search 命中 → 留痕（供「写前查重」闸门放行用）"""
+    """mh_search 命中 → 留痕（供「写前查重」闸门放行用）
+
+    🔴 只认**自报姓名**的 requester（2026-09-18 老大纠正）。
+    不填姓名就只记全库统计、不记到任何人名下 —— 否则所有不填 requester 的 agent
+    会共用 "mcp-client" 一个身份，变成"A 搜了，B 也能白嫖"。
+    """
     st = _gate_load()
     now = time.time()
-    st["last_search_at"] = now
-    ag = _gate_ag(st, requester or "mcp-client")
-    ag["searched_at"] = now
-    ag["search_count"] = ag.get("search_count", 0) + 1
+    st["last_search_at"] = now          # 全库统计用，不参与放行判定
+    rq = (requester or "").strip()
+    if rq and rq != "mcp-client":
+        ag = _gate_ag(st, rq)
+        ag["searched_at"] = now
+        ag["search_count"] = ag.get("search_count", 0) + 1
     _gate_save(st)
 
 
 def gate_mark_handbook(tool_name):
-    """mh_tool 取到「openmem 使用手册」→ 记为已领规矩"""
+    """mh_tool 取到「openmem 使用手册」→ 记一笔「有人领过手册」（**仅统计**）
+
+    🔴 不参与放行判定（2026-09-18 老大纠正）：规矩按 agent 各自算，不能集体荣誉。
+    放行只看 ag["rules_taught_at"]（= 你自己那次被拦时拿到的规矩全文）。
+    这里之所以仍只记全库时间戳：mh_tool 的入参没有 agent 身份（server.js schema 只有 name）。
+    """
     if not tool_name or GATE_HANDBOOK not in str(tool_name):
         return False
     st = _gate_load()
@@ -332,40 +351,43 @@ def _gate_exempt(ag, kind, now):
 
 
 def gate_check_write(source):
-    """闸门 ①②：返回 None=放行；返回 dict=拦下（已可直接 out()）"""
+    """闸门 ①②：返回 None=放行；返回 dict=拦下（已可直接 out()）
+
+    🔴 两道闸门都按 source（=「你自己」）记账，不看别人（2026-09-18 老大纠正）。
+    规矩/查重是每个 agent 各自的义务 —— 别人领过、别人搜过，与你无关。
+    """
     st = _gate_load()
     now = time.time()
     ag = _gate_ag(st, source)
 
-    # ① 规矩闸门
-    if now - st.get("last_handbook_at", 0) > GATE_SKILL_HOURS * 3600:
+    # ① 规矩闸门：你自己 24h 内没被教过规矩 → 拦
+    #    拦下的这一瞬间，规矩全文就在返回体里（= 已送达）；下次再写即放行。
+    if now - ag.get("rules_taught_at", 0) > GATE_SKILL_HOURS * 3600:
         if not _gate_denied(ag, "skill", now):
+            ag["rules_taught_at"] = now
             _gate_exempt(ag, "skill", now)
             _gate_save(st)
             return {
                 "ok": False, "gate": "rules", "denied": True,
-                "reason": "写入被拦（第 1 关 / 共 3 关）：本次长期没人领过写入规矩就动手写了。",
-                "how_to_pass": '先调 mh_tool(name="openmem 使用手册") 拿规矩，然后再写一次即可放行。',
-                "note": "这道闸门每个 agent 只拦一次（拦过豁免 7 天），不是为难你 —— 是「不擦屁股」的代价。",
+                "reason": "写入被拦（第 1 关 / 共 3 关）：你（%s）24h 内还没读过写入规矩就下笔了。" % source,
+                "how_to_pass": "规矩全文就在下面这个 rules 字段里（本返回体）。看完直接**再调用一次 mh_write** 即可放行，不用去别处领。",
+                "note": "本关按 agent 各自记账、各自只拦一次（拦过豁免 7 天）—— 别的 agent 读过规矩，不代表你可以跳过。",
                 "rules": GATE_RULES,
             }
         ag["skill_skipped"] = True
         _gate_save(st)
 
-    # ② 查重闸门
-    last_own = ag.get("searched_at", 0)
-    last_any = st.get("last_search_at", 0)
-    own_ok = (now - last_own) <= GATE_SEARCH_MIN * 60
-    any_ok = (now - last_any) <= GATE_SEARCH_ANY_MIN * 60
-    if not own_ok and not any_ok:
+    # ② 查重闸门：你自己 30min 内没搜过库 → 拦
+    if (now - ag.get("searched_at", 0)) > GATE_SEARCH_MIN * 60:
         if not _gate_denied(ag, "search", now):
             _gate_exempt(ag, "search", now)
             _gate_save(st)
             return {
                 "ok": False, "gate": "search", "denied": True,
-                "reason": "写入被拦（第 2 关 / 共 3 关）：下笔前没搜过库 —— 重复条目就是这么来的。",
-                "how_to_pass": "先 mh_search(<你这条的关键词>)，看完结果再写一次即可放行。",
-                "note": "每个 agent 只拦一次（拦过豁免 7 天）。",
+                "reason": "写入被拦（第 2 关 / 共 3 关）：你（%s）下笔前没搜过库 —— 重复条目就是这么来的。" % source,
+                "how_to_pass": '先 mh_search(<你这条的关键词>, requester="%s")，'
+                               '**必须带上 requester 才记得到你名下**；看完结果再写一次即可放行。' % source,
+                "note": "本关按 agent 各自记账、各自只拦一次（拦过豁免 7 天）。",
                 "rules": GATE_RULES,
             }
         ag["search_skipped"] = True
@@ -1000,7 +1022,8 @@ def cmd_gate(a):
     agents = {}
     for k, v in sorted(st.get("agents", {}).items()):
         agents[k] = {
-            "searched_at": _ago(v.get("searched_at")),
+            "rules_taught_at": _ago(v.get("rules_taught_at")),   # 你自己被教过规矩的时刻（①关放行依据）
+            "searched_at": _ago(v.get("searched_at")),           # 你自己搜过库的时刻（②关放行依据）
             "rules_exempt": _exempt(v.get("skill_deny_until")),
             "search_exempt": _exempt(v.get("search_deny_until")),
             "denied": {"rules": v.get("skill_denied", 0), "search": v.get("search_denied", 0),
@@ -1008,8 +1031,10 @@ def cmd_gate(a):
         }
     out({"ok": True,
          "now": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
-         "last_handbook": _ago(st.get("last_handbook_at")),
-         "last_search_any": _ago(st.get("last_search_at")),
+         "_note": "下面两个 last_* 只是全库统计，不参与任何闸门判定（判定一律看 agents 里各自的时刻）",
+         "stats_only": {
+             "last_handbook": _ago(st.get("last_handbook_at")),
+             "last_search_any": _ago(st.get("last_search_at"))},
          "params": {"skill_hours": GATE_SKILL_HOURS, "search_min": GATE_SEARCH_MIN,
                     "grace_days": GATE_GRACE_DAYS, "dup_hi": GATE_DUP_HI},
          "agents": agents,
