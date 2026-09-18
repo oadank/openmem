@@ -237,12 +237,200 @@ def do_ask_stream(query, requester, history=None, session_id=None, extra_context
         yield {"event": "related", "questions": related}
 
 
+# ── 写入闸门（2026-09-18 老大拍板）─────────────────────────
+# 信念：全体 agent 都是 openmem 的共建者 —— 不能只拉屎不擦屁股。
+#   ① 规矩闸门：24h 内没人领过手册 → 拦一次，把「写入四步」甩回它上下文
+#   ② 查重闸门：本 agent（或全库）最近没人搜过 → 拦一次，逼它先 mh_search
+#   ③ 重复闸门：要写的这条库里已有 ≥GATE_DUP_HI 相似度 → 拦，逼它去 mh_update
+#      + 放行时回显最像的 N 条，把"重复证据"直接拍它脸上
+# 安全阀：每 source 每类闸门只拦一次，拦过豁免 GATE_GRACE_DAYS 天
+#         （宁可少拦，不能卡死写入 —— 写入被卡 = 记忆丢失，比污染更糟）。
+# 只拦 mh_write（新增）；mh_update 一律放行 —— 那正是我们鼓励的"擦屁股"动作。
+# 改本文件立即生效（MCP 每次调用 spawn 新 Python，无需重启服务）。
+
+GATE_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_gate_state.json")
+GATE_SKILL_HOURS = 24     # 规矩有效期（小时）
+GATE_SEARCH_MIN = 30      # 查重时间窗（分钟）
+GATE_SEARCH_ANY_MIN = 5   # 兜底：全库任意人搜过也算（多数 agent 不填 requester）
+GATE_GRACE_DAYS = 7       # 被拦一次后的豁免期（安全阀）
+GATE_DUP_HI = 0.95        # 相似度红线：≥ 视为重复
+GATE_DUP_SHOW = 3         # 回显相似条数
+GATE_HANDBOOK = "openmem 使用手册"
+
+GATE_RULES = """【你是 openmem 的共建者，不是过客 —— 不能只拉屎不擦屁股】
+
+写入前四步（2026-09-18 定死）：
+1) 先搜：mh_search(关键词)，再换 1~2 个近义词搜一遍 —— 库里可能已经有了
+2) 有则原地改：mh_update(id, content=…) —— 保留 id、不新增
+3) 无则新增：确认真的没有，才 mh_write
+4) 同主题只维护一条「活条目」：版本 / 状态变了就 update 那一条，禁止一版一条流水账
+
+错的直接删（不搞归档）：
+  curl -X DELETE "http://127.0.0.1:3467/api/entry?id=<uuid>"
+
+规矩全文：mh_tool(name="openmem 使用手册")"""
+
+
+def _gate_load():
+    try:
+        with open(GATE_STATE_PATH, encoding="utf-8") as f:
+            st = json.load(f)
+        if isinstance(st, dict):
+            st.setdefault("agents", {})
+            st.setdefault("last_handbook_at", 0)
+            st.setdefault("last_search_at", 0)
+            return st
+    except Exception:
+        pass
+    return {"agents": {}, "last_handbook_at": 0, "last_search_at": 0}
+
+
+def _gate_save(st):
+    try:
+        tmp = GATE_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, GATE_STATE_PATH)   # 原子替换，避免并发写坏
+    except Exception:
+        pass
+
+
+def _gate_ag(st, source):
+    return st["agents"].setdefault(source or "unknown", {})
+
+
+def gate_mark_search(requester):
+    """mh_search 命中 → 留痕（供「写前查重」闸门放行用）"""
+    st = _gate_load()
+    now = time.time()
+    st["last_search_at"] = now
+    ag = _gate_ag(st, requester or "mcp-client")
+    ag["searched_at"] = now
+    ag["search_count"] = ag.get("search_count", 0) + 1
+    _gate_save(st)
+
+
+def gate_mark_handbook(tool_name):
+    """mh_tool 取到「openmem 使用手册」→ 记为已领规矩"""
+    if not tool_name or GATE_HANDBOOK not in str(tool_name):
+        return False
+    st = _gate_load()
+    st["last_handbook_at"] = time.time()
+    _gate_save(st)
+    return True
+
+
+def _gate_denied(ag, kind, now):
+    """安全阀：该 agent 这类闸门是否还在豁免期内"""
+    return now < ag.get(kind + "_deny_until", 0)
+
+
+def _gate_exempt(ag, kind, now):
+    ag[kind + "_deny_until"] = now + GATE_GRACE_DAYS * 86400
+    ag[kind + "_denied"] = ag.get(kind + "_denied", 0) + 1
+    ag[kind + "_denied_at"] = now
+
+
+def gate_check_write(source):
+    """闸门 ①②：返回 None=放行；返回 dict=拦下（已可直接 out()）"""
+    st = _gate_load()
+    now = time.time()
+    ag = _gate_ag(st, source)
+
+    # ① 规矩闸门
+    if now - st.get("last_handbook_at", 0) > GATE_SKILL_HOURS * 3600:
+        if not _gate_denied(ag, "skill", now):
+            _gate_exempt(ag, "skill", now)
+            _gate_save(st)
+            return {
+                "ok": False, "gate": "rules", "denied": True,
+                "reason": "写入被拦（第 1 关 / 共 3 关）：本次长期没人领过写入规矩就动手写了。",
+                "how_to_pass": '先调 mh_tool(name="openmem 使用手册") 拿规矩，然后再写一次即可放行。',
+                "note": "这道闸门每个 agent 只拦一次（拦过豁免 7 天），不是为难你 —— 是「不擦屁股」的代价。",
+                "rules": GATE_RULES,
+            }
+        ag["skill_skipped"] = True
+        _gate_save(st)
+
+    # ② 查重闸门
+    last_own = ag.get("searched_at", 0)
+    last_any = st.get("last_search_at", 0)
+    own_ok = (now - last_own) <= GATE_SEARCH_MIN * 60
+    any_ok = (now - last_any) <= GATE_SEARCH_ANY_MIN * 60
+    if not own_ok and not any_ok:
+        if not _gate_denied(ag, "search", now):
+            _gate_exempt(ag, "search", now)
+            _gate_save(st)
+            return {
+                "ok": False, "gate": "search", "denied": True,
+                "reason": "写入被拦（第 2 关 / 共 3 关）：下笔前没搜过库 —— 重复条目就是这么来的。",
+                "how_to_pass": "先 mh_search(<你这条的关键词>)，看完结果再写一次即可放行。",
+                "note": "每个 agent 只拦一次（拦过豁免 7 天）。",
+                "rules": GATE_RULES,
+            }
+        ag["search_skipped"] = True
+    _gate_save(st)
+    return None
+
+
+def _gate_neighbours(cur, emb_vec, limit=GATE_DUP_SHOW, exclude_id=None):
+    """库里与本条最像的 N 条（跨 source，含相似度）"""
+    q = vec_literal(emb_vec)
+    ex = exclude_id or "00000000-0000-0000-0000-000000000000"
+    cur.execute("""SELECT id, source, category, content, 1 - (embedding_v <=> %s::vector) AS score
+                   FROM memory_entries
+                   WHERE superseded_by IS NULL AND embedding_v IS NOT NULL AND id <> %s
+                   ORDER BY embedding_v <=> %s::vector
+                   LIMIT %s""", [q, ex, q, limit])
+    return [{"id": str(r[0]), "source": r[1], "category": r[2],
+             "score": round(float(r[4]), 4), "snippet": (r[3] or "")[:120]}
+            for r in cur.fetchall()]
+
+
+def gate_check_dup(cur, source, emb_vec, content):
+    """闸门 ③：库里已有高度相似的条目 → 拦，逼它 mh_update（同内容只拦一次）"""
+    try:
+        near = _gate_neighbours(cur, emb_vec, GATE_DUP_SHOW)
+    except Exception:
+        cur.connection.rollback()
+        return None
+    if not near or near[0]["score"] < GATE_DUP_HI:
+        return None
+    h = content_hash(content)[:16]
+    st = _gate_load(); ag = _gate_ag(st, source)
+    seen = ag.setdefault("dup_seen", [])
+    if h in seen:            # 同一版内容坚持要写 → 放行（安全阀）
+        return None
+    seen.append(h)
+    ag["dup_seen"] = seen[-30:]
+    ag["dup_denied"] = ag.get("dup_denied", 0) + 1
+    _gate_save(st)
+    return {
+        "ok": False, "gate": "dup", "denied": True,
+        "reason": "写入被拦（第 3 关 / 共 3 关）：这条与库里已有条目相似度 %.2f，基本是同一件事。" % near[0]["score"],
+        "similar": near,
+        "how_to_pass": "正确做法是擦屁股：mh_update(id=\"%s\", content=\"<合并后的最新版>\")。" % near[0]["id"],
+        "note": "若确实不是一回事（只是话题相近），把内容写得更具体再提交一次即可放行。",
+        "rules": GATE_RULES,
+    }
+
+
 # ── 写入 / 检索 ───────────────────────────────────────────
 
 def cmd_write(a):
     a.content, _cred_hits = sanitize_credentials(a.content)
     emb_vec = emb([a.content])[0]
     conn = connect(); cur = conn.cursor()
+
+    # ── 写入闸门 ①②：规矩 + 查重（2026-09-18）────────────
+    gate = gate_check_write(a.source)
+    if gate:
+        cur.close(); conn.close(); out(gate); return
+    # ── 写入闸门 ③：与库里已有条目高度雷同 → 逼它去 update
+    dup = gate_check_dup(cur, a.source, emb_vec, a.content)
+    if dup:
+        cur.close(); conn.close(); out(dup); return
+
     ch = content_hash(a.content)
     cur.execute("""
         INSERT INTO memory_entries (layer, category, source, content, embedding, embedding_v, tags,
@@ -256,9 +444,22 @@ def cmd_write(a):
     """, (a.layer, a.category, a.source, clean_nul(a.content), to_pg_array(emb_vec),
           vec_literal(emb_vec), a.tags, a.confidence, a.pinned, ch))
     row = cur.fetchone()
+    # 写后回显：把库里最像的几条拍给它看（正面引导去重，不拦人）
+    similar = []
+    try:
+        similar = _gate_neighbours(cur, emb_vec, GATE_DUP_SHOW, exclude_id=str(row[0]))
+    except Exception:
+        cur.connection.rollback()
     conn.commit(); cur.close(); conn.close()
-    out({"ok": True, "id": str(row[0]), "inserted": bool(row[1]),
-         "cred_masked": _cred_hits})
+    res = {"ok": True, "id": str(row[0]), "inserted": bool(row[1]),
+           "cred_masked": _cred_hits}
+    if similar:
+        res["similar"] = similar
+        if similar[0]["score"] >= 0.85:
+            res["tip"] = ("注意：库里已有相似度 %.2f 的条目（%s）。若属同主题，请改用 "
+                          'mh_update(id="%s", content="<合并后的最新版>")，别再堆第二条。'
+                          % (similar[0]["score"], similar[0]["id"], similar[0]["id"]))
+    out(res)
 
 
 def cmd_update(a):
@@ -487,6 +688,27 @@ def cmd_search(a):
             scored.append({"id": str(r[0]), "layer": r[1], "category": r[2], "source": r[3],
                            "content": r[4][:1500], "tags": r[5], "pinned": r[6],
                            "created_at": r[7].isoformat(), "score": round(float(sc), 5)})
+    # —— 检索留痕（2026-09-15）：只记查询与命中 id，供治理用；失败绝不影响检索 ----------
+    try:
+        conn2 = connect(); cur2 = conn2.cursor()
+        cur2.execute("""CREATE TABLE IF NOT EXISTS search_log (
+            id BIGSERIAL PRIMARY KEY,
+            requester TEXT DEFAULT '',
+            query TEXT NOT NULL,
+            top_k INT,
+            hits JSONB,
+            created_at TIMESTAMPTZ DEFAULT now())""")
+        cur2.execute("INSERT INTO search_log (requester, query, top_k, hits) VALUES (%s,%s,%s,%s)",
+                     (getattr(a, 'requester', '') or '', a.query[:2000], a.top_k,
+                      json.dumps([e['id'] for e in scored[:10]])))
+        conn2.commit(); cur2.close(); conn2.close()
+    except Exception:
+        pass
+    # —— 闸门留痕（2026-09-18）：给「写前查重」闸门当放行依据；失败绝不影响检索 ----------
+    try:
+        gate_mark_search(getattr(a, "requester", "") or "")
+    except Exception:
+        pass
     cur.close(); conn.close()
     out({"ok": True, "results": scored, "pool": pool,
          "elapsed_ms": int((time.time() - t0) * 1000)})
@@ -621,6 +843,11 @@ def cmd_tool_call(a):
         cur.close(); conn.close()
         out({"ok": False, "error": f"工具不存在: {a.name}"}); return
     tid, name, tmpl, cached, updated_at, interval = r
+    # 领规矩留痕（2026-09-18）：取到「openmem 使用手册」= 已读写入规矩 → 规矩闸门放行
+    try:
+        gate_mark_handbook(name)
+    except Exception:
+        pass
     fresh = False
     if cached and updated_at and interval:
         from datetime import timedelta
@@ -742,6 +969,53 @@ def cmd_import_batch(a):
          "skipped_existing": skipped, "rejected_insights": rejected, "failed": failed,
          "cred_masked_entries": masked_n})
 
+def cmd_gate(a):
+    """写入闸门状态查看 / 重置（2026-09-18）"""
+    st = _gate_load()
+    if getattr(a, "reset_all", False):
+        _gate_save({"agents": {}, "last_handbook_at": 0, "last_search_at": 0})
+        out({"ok": True, "reset": "all", "note": "闸门状态已清空（所有人重新算）"})
+        return
+    src = getattr(a, "reset", None)
+    if src:
+        st["agents"].pop(src, None)
+        _gate_save(st)
+        out({"ok": True, "reset": src, "note": "该 agent 的豁免与留痕已清（下次写入会重新过闸）"})
+        return
+    now = time.time()
+
+    def _ago(ts):
+        if not ts:
+            return None
+        d = now - ts
+        return {"at": datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
+                "ago_min": int(d // 60)}
+
+    def _exempt(ts):
+        if not ts:
+            return None
+        return {"until": datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
+                "left_min": int((ts - now) // 60)}
+
+    agents = {}
+    for k, v in sorted(st.get("agents", {}).items()):
+        agents[k] = {
+            "searched_at": _ago(v.get("searched_at")),
+            "rules_exempt": _exempt(v.get("skill_deny_until")),
+            "search_exempt": _exempt(v.get("search_deny_until")),
+            "denied": {"rules": v.get("skill_denied", 0), "search": v.get("search_denied", 0),
+                       "dup": v.get("dup_denied", 0)},
+        }
+    out({"ok": True,
+         "now": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
+         "last_handbook": _ago(st.get("last_handbook_at")),
+         "last_search_any": _ago(st.get("last_search_at")),
+         "params": {"skill_hours": GATE_SKILL_HOURS, "search_min": GATE_SEARCH_MIN,
+                    "grace_days": GATE_GRACE_DAYS, "dup_hi": GATE_DUP_HI},
+         "agents": agents,
+         "state_file": GATE_STATE_PATH})
+
+
 def cmd_status(a):
     conn = connect(); cur = conn.cursor()
     for label, sql in [("total", "SELECT count(*) FROM memory_entries"),
@@ -789,6 +1063,7 @@ def main():
     s.add_argument("--top_k", type=int, default=10)
     s.add_argument("--candidates", type=int, default=4000)
     s.add_argument("--include_archived", action="store_true")
+    s.add_argument("--requester", default="", help="调用方 agent 名（留痕用，可空）")
     s.set_defaults(func=lambda a: cmd_search(_tags(a)))
 
     sv = sub.add_parser("service")
@@ -819,6 +1094,12 @@ def main():
 
     ib = sub.add_parser("import_batch"); ib.add_argument("--file", required=True)
     ib.set_defaults(func=cmd_import_batch)
+
+    gt = sub.add_parser("gate", help="写入闸门状态 / 重置（2026-09-18）")
+    gt.add_argument("--status", action="store_true", help="看闸门状态（默认行为）")
+    gt.add_argument("--reset", metavar="SOURCE", help="清某个 agent 的闸门留痕与豁免")
+    gt.add_argument("--reset_all", action="store_true", help="清空全部闸门状态")
+    gt.set_defaults(func=cmd_gate)
 
     sub.add_parser("status").set_defaults(func=cmd_status)
 
