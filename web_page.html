@@ -366,15 +366,21 @@ body.light mark{background:#ffe9a8}
           <div class="cfg-note">智能体是本机常驻的 opencode 服务（:4098，nssm <b>opencode-research</b>），只读查证本机信息（配置文件/API/目录），把回执融进答案。它用的模型从 opencode.json 读取，保存后立即生效（无需重启智能体）。</div>
         </div>
         <div class="card">
-          <div class="sec-title">🧹 记忆治理（全自动流水线）</div>
-          <div class="cfg-note">一键跑完：openmem 扫库出计划 → 研究智能体交叉验证（AI 审计员逐簇核对）→ 自动批准执行软归档（可回滚）→ 终验报告。全程实时可视，跑完看报告就行。</div>
-          <div class="row" style="margin-top:10px;margin-bottom:0">
-            <button class="act" onclick="govAuto()" id="gov-auto-btn">🧹 一键治理</button>
+          <div class="sec-title">🧹 记忆治理（后台任务 · 可关页）</div>
+          <div class="cfg-note">后台任务：扫库 → <b>AI 审核</b>（纯 API 逐组判是否可并）→ 只执行审核通过的合并/归档 → 滚动备份（只留最近一份）。相似度只做提名，判决看模型。页面只看进度，<b>切走/刷新不丢任务</b>。</div>
+          <div class="row" style="margin-top:10px;margin-bottom:0;flex-wrap:wrap;gap:8px">
+            <button class="act" onclick="govStart('safe')" id="gov-safe-btn">🧹 安全合并（推荐）</button>
+            <button class="ghost" onclick="govStart('all')" id="gov-all-btn">🔥 激进全部执行</button>
             <span class="cfg-note" id="gov-stage" style="margin:0"></span>
           </div>
-          <div id="gov-plan" style="display:none;margin-top:12px"></div>
-          <div id="gov-verdict" style="display:none;margin-top:10px"></div>
+          <div class="form-line" style="margin-top:10px">
+            <label>小条合并阈值</label>
+            <input type="number" id="gov-thr" value="0.88" min="0.80" max="0.99" step="0.01" style="width:70px">
+            <span class="cfg-note" style="margin:0">0.88 更敢并；0.93 接近旧版去重</span>
+          </div>
+          <div id="gov-log" style="display:none;margin-top:12px;font-family:var(--mono,monospace);font-size:12px;color:var(--dim);max-height:140px;overflow:auto;white-space:pre-wrap"></div>
           <div id="gov-report" style="display:none;margin-top:10px"></div>
+          <div class="cfg-note" id="gov-status-line" style="margin-top:8px"></div>
         </div>
         <div class="card">
           <div class="sec-title">🗂 agent-matrix 同步（36 服务总表）</div>
@@ -1244,148 +1250,115 @@ async function amRefresh(btn){
 
 // 研究智能体：状态展示 + 模型/开关配置
 
-// ── 记忆治理：一键全自动流水线 ──
-let govPlan = null;
-
-// 后台分批治理进度轮询：每 10s 读账本，完成自动展示终验报告
+// ── 记忆治理：服务器后台 job（可关页） ──
 let govPollTimer = null;
+
+function govRenderLog(j){
+  const el = document.getElementById('gov-log');
+  if(!el) return;
+  el.style.display = 'block';
+  el.textContent = (j.log||[]).join('\n') || '(暂无日志)';
+  el.scrollTop = el.scrollHeight;
+}
+
+function govRenderReport(j){
+  const rp = document.getElementById('gov-report');
+  if(!rp) return;
+  const r = j.result || {};
+  const sm = j.plan_summary || {};
+  if(j.phase==='error' || r.error){
+    rp.style.display='block';
+    rp.innerHTML = '<div class="cfg-note" style="color:var(--red)">'+esc(r.error||'任务失败')+'</div>';
+    return;
+  }
+  if(j.phase!=='done' && !r.merged) return;
+  rp.style.display='block';
+  const lines = [];
+  if(sm.total!=null) lines.push('扫描活跃记忆 **'+sm.total+'** 条');
+  if(sm.merges!=null) lines.push('合并组候选 **'+sm.merges+'**');
+  if(sm.clusters!=null) lines.push('归档簇候选 **'+sm.clusters+'**');
+  if(sm.snapshots!=null) lines.push('真快照组 **'+sm.snapshots+'**');
+  lines.push('');
+  lines.push('**实际合并** '+(r.merged_n!=null?r.merged_n:(r.merged||[]).length)+' 组');
+  lines.push('**实际归档** '+(r.archived_n!=null?r.archived_n:(r.archived||[]).length)+' 条（软归档可回滚）');
+  if(r.active_after!=null) lines.push('活跃记忆现为 **'+r.active_after+'**（历史归档累计 '+r.archived_total+'）');
+  if(r.skipped && r.skipped.length) lines.push('跳过 '+r.skipped.length+' 条');
+  rp.innerHTML = '<div class="research-block"><div class="rs-head"><span class="rs-agent">📋 后台治理完成</span></div>'
+    +'<div class="md rs-body">'+mdRender(lines.join('\n'))+'</div></div>';
+}
+
 function govStartPolling(){
   if(govPollTimer) return;
   govPollTimer = setInterval(async ()=>{
     try{
-      const j = await jget('/api/govern/status');
+      const j = await jget('/api/govern/job');
       const stage = document.getElementById('gov-stage');
-      const rp = document.getElementById('gov-report');
+      const line = document.getElementById('gov-status-line');
       if(!stage){ clearInterval(govPollTimer); govPollTimer=null; return; }
-      if(j.finished){
+      govRenderLog(j);
+      if(j.running){
+        stage.textContent = '🔁 后台运行中 · '+(j.phase||'…')+' · job '+esc(j.job_id||'');
+        if(line) line.textContent = '已启动 '+esc(j.started||'')+'，可关闭此页，任务在服务端继续。';
+        if(document.getElementById('gov-safe-btn')) document.getElementById('gov-safe-btn').disabled = true;
+        if(document.getElementById('gov-all-btn')) document.getElementById('gov-all-btn').disabled = true;
+        return;
+      }
+      if(j.phase==='done'){
         clearInterval(govPollTimer); govPollTimer=null;
         stage.textContent = '';
-        rp.style.display='block';
-        rp.innerHTML = '<div class="research-block"><div class="rs-head"><span class="rs-agent">📋 后台治理完成 · 终验报告</span></div>'
-          +'<div class="md rs-body">'+mdRender('**后台流水线共归档 '+j.archived_total+' 条**，跑完 '+((j.rounds||[]).length)+' 轮，结束 '+esc(j.end||'')+'。活跃记忆剩 '+j.active_after+' 条（全部软归档，可回滚）')+'</div></div>';
+        govRenderReport(j);
+        if(line) line.textContent = '结束于 '+esc(j.finished||'');
+        if(document.getElementById('gov-safe-btn')) document.getElementById('gov-safe-btn').disabled = false;
+        if(document.getElementById('gov-all-btn')) document.getElementById('gov-all-btn').disabled = false;
         loadStats();
         return;
       }
-      if(j.running){
-        stage.textContent = '🔁 后台分批治理中：已跑 '+((j.rounds||[]).length)+' 轮 · 已归档 '+(j.archived_total||0)+' 条（每 10 秒刷新，跑完自动出报告）';
+      if(j.phase==='error'){
+        clearInterval(govPollTimer); govPollTimer=null;
+        stage.textContent = '❌ 失败';
+        govRenderReport(j);
+        if(document.getElementById('gov-safe-btn')) document.getElementById('gov-safe-btn').disabled = false;
+        if(document.getElementById('gov-all-btn')) document.getElementById('gov-all-btn').disabled = false;
+        return;
       }
+      if(line && j.started) line.textContent = '上次启动 '+esc(j.started);
     }catch(e){}
-  }, 10000);
+  }, 2500);
 }
 
-async function govAuto(){
-  const btn = document.getElementById('gov-auto-btn');
+async function govStart(mode){
+  const thr = (document.getElementById('gov-thr')||{}).value || '0.88';
   const stage = document.getElementById('gov-stage');
-  const p = document.getElementById('gov-plan');
-  const d = document.getElementById('gov-verdict');
   const rp = document.getElementById('gov-report');
-  btn.disabled = true;
-  d.style.display='none'; rp.style.display='none';
-
-  // ① 扫库
-  stage.textContent = '① 扫库中…（全库向量比对）';
-  p.style.display='block';
-  p.innerHTML = '<div class="cfg-note">⏳ 扫库中（全库向量比对，约 30-60 秒）…</div>';
+  const log = document.getElementById('gov-log');
+  if(rp) rp.style.display='none';
+  if(log) log.style.display='none';
+  if(document.getElementById('gov-safe-btn')) document.getElementById('gov-safe-btn').disabled = true;
+  if(document.getElementById('gov-all-btn')) document.getElementById('gov-all-btn').disabled = true;
+  stage.textContent = '启动后台任务…';
   try{
-    govPlan = await jget('/api/govern/scan');
+    const j = await jpost('/api/govern/run', {mode, threshold_small: parseFloat(thr)});
+    if(!j.ok){ toast(j.error||'启动失败'); stage.textContent = j.error||'启动失败';
+      if(document.getElementById('gov-safe-btn')) document.getElementById('gov-safe-btn').disabled=false;
+      if(document.getElementById('gov-all-btn')) document.getElementById('gov-all-btn').disabled=false;
+      return; }
+    stage.textContent = '✅ 已提交 job '+j.job_id+'（服务端后台跑，可关页）';
+    govStartPolling();
   }catch(e){
-    p.innerHTML='<div class="cfg-note" style="color:var(--red)">扫库失败：'+esc(e.message)+'</div>';
-    btn.disabled=false; return;
+    stage.textContent = '启动失败：'+e.message;
+    if(document.getElementById('gov-safe-btn')) document.getElementById('gov-safe-btn').disabled=false;
+    if(document.getElementById('gov-all-btn')) document.getElementById('gov-all-btn').disabled=false;
   }
-  const nSnap = (govPlan.snapshots||[]).length, nClu = (govPlan.clusters||[]).length;
-  if(!nSnap && !nClu){
-    p.innerHTML='<div class="cfg-note" style="color:var(--green)">✅ 扫描完成：共 '+govPlan.total+' 条，没发现相似簇和快照积压，记忆很干净。</div>';
-    stage.textContent=''; btn.disabled=false; return;
-  }
-  let html = '<div class="cfg-note">扫描完成：活跃记忆 <b>'+govPlan.total+'</b> 条</div>';
-  if(nSnap){
-    html += '<div class="dlg-sec">📦 同源快照积压 '+nSnap+' 组，共可归档 '+govPlan.snapshots.reduce((n,s)=>n+s.count,0)+' 条</div><div class="chips">'
-      + govPlan.snapshots.slice(0,12).map(s=>'<span class="chip ref" title="'+esc(s.sample)+'">'+esc(s.source)+' · 归档 '+s.count+' 条</span>').join('')+'</div>';
-  }
-  if(nClu){
-    html += '<div class="dlg-sec">🔁 语义相似簇 '+nClu+' 组</div><div class="chips">'
-      + govPlan.clusters.slice(0,12).map(c=>'<span class="chip ref" title="'+esc(c.sample)+'">相似 '+c.sim+' · 归档 '+c.archive.length+' 条</span>').join('')+'</div>';
-  }
-  p.innerHTML = html;
-
-  // ② AI 交叉验证（SSE 实时）
-  stage.textContent = '② AI 交叉验证中…（实时滚动）';
-  d.style.display='block';
-  d.innerHTML = '<div class="research-block pending"><div class="rs-head"><span class="rs-agent">🔬 AI 审计员</span>'
-    +'<span class="rs-task">'+esc('抽样深度核对 '+Math.min(nClu,8)+' 簇 + 快照抽查')+'</span></div>'
-    +'<div class="rs-status">🔬 验证中…（工具执行实时滚动）</div>'
-    +'<div class="rs-live" id="gov-rslive"></div>'
-    +'<div class="rs-body md" id="gov-rsbody" style="display:none"></div></div>';
-  const live = document.getElementById('gov-rslive');
-  const body = document.getElementById('gov-rsbody');
-  const block = d.querySelector('.research-block');
-  let verdict = '';
-  try{
-    const resp = await fetch('/api/govern/verify', {method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({plan: govPlan})});
-    if(!resp.ok) throw new Error('HTTP '+resp.status);
-    const reader = resp.body.getReader(), dec = new TextDecoder('utf-8');
-    let buf = '';
-    stream:
-    while(true){
-      const {done, value} = await reader.read();
-      if(done) break;
-      buf += dec.decode(value, {stream:true});
-      let idx;
-      while((idx = buf.indexOf('\n\n')) >= 0){
-        const chunk = buf.slice(0, idx); buf = buf.slice(idx+2);
-        if(!chunk.startsWith('data: ')) continue;
-        let ev; try{ ev = JSON.parse(chunk.slice(6)); }catch(e){ continue; }
-        if(ev.event==='research_started'){
-          addLiveLine(live, '🚀 智能体开工');
-        }else if(ev.event==='research_tool'){
-          const doneT = ev.status==='completed';
-          addLiveLine(live, (doneT?'✅':'🛠')+' ['+(ev.tool||'bash')+'] '+esc((ev.input||'').replace(/\s+/g,' ').slice(0,110)));
-        }else if(ev.event==='research_thought'){
-          let th = document.getElementById('gov-rsthink');
-          if(!th){ th=document.createElement('div'); th.id='gov-rsthink'; th.className='rs-think'; live.appendChild(th); }
-          th.textContent = '💭 '+esc((ev.text||'').replace(/\s+/g,' ').slice(-180));
-        }else if(ev.event==='research_done'){
-          verdict = ev.result||'';
-          break stream;
-        }else if(ev.event==='research_error'){
-          block.querySelector('.rs-status').textContent='⚠️ 验证未完成';
-          body.innerHTML = '<span style="color:var(--yellow)">'+esc(ev.error||'')+'</span>';
-          body.style.display='block';
-          stage.textContent=''; btn.disabled=false; return;
-        }
-      }
-    }
-    const st = block.querySelector('.rs-status');
-    if(st){ st.textContent='✅ 验证完成'; st.style.color='var(--green)'; }
-    body.innerHTML = mdRender(verdict);
-    body.style.display='block';
-  }catch(e){
-    d.innerHTML='<div class="cfg-note" style="color:var(--red)">验证失败：'+esc(e.message)+'</div>';
-    stage.textContent=''; btn.disabled=false; return;
-  }
-
-  // ③ 自动批准执行 + 终验
-  stage.textContent = '③ 执行归档 + 终验…';
-  rp.style.display='block';
-  rp.innerHTML = '<div class="cfg-note">⏳ 执行归档并终验中…</div>';
-  try{
-    const j = await jpost('/api/govern/execute', {plan: govPlan});
-    const nArch = (j.archived||[]).length;
-    rp.innerHTML = '<div class="research-block"><div class="rs-head"><span class="rs-agent">📋 治理完成 · 终验报告</span></div>'
-      +'<div class="md rs-body">'+mdRender((j.report||'')+'\n\n**本轮实际归档：'+nArch+' 条**（AI 交叉验证通过后执行；软归档 superseded_by，可回滚）')+'</div>'
-      +(j.skipped&&j.skipped.length ? '<div class="rs-body" style="color:var(--yellow)">跳过 '+j.skipped.length+' 条（已钉住/已归档/异常）</div>' : '')
-      +'</div>';
-    stage.textContent='';
-    loadStats();
-  }catch(e){
-    rp.innerHTML='<div class="cfg-note" style="color:var(--red)">执行失败：'+esc(e.message)+'</div>';
-    stage.textContent='';
-  }
-  btn.disabled = false;
-  govStartPolling();
 }
+
+document.addEventListener('DOMContentLoaded', ()=>{
+  try{
+    jget('/api/govern/job').then(j=>{
+      if(j && j.running) govStartPolling();
+      else if(j && j.phase==='done' && j.result){ govRenderLog(j); govRenderReport(j); }
+    }).catch(()=>{});
+  }catch(e){}
+});
 
 async function loadAgentConfig(){
   try{

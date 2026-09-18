@@ -84,22 +84,56 @@ def agent_set_model(model):
     return {"ok": True, "model": model}
 
 
+def _litellm_model_ids():
+    """从本机 litellm 拉 model_list 的 model_name（去重）"""
+    try:
+        key = os.environ.get("OPENMEM_LLM_KEY") or ""   # 🔴 凭据只走 .env，禁止硬编码（09-18 清；本仓库是 public）
+        base = (os.environ.get("OPENMEM_LLM_BASE_URL") or "http://127.0.0.1:4000").rstrip("/")
+        r = requests.get(base + "/v1/models", headers={"Authorization": f"Bearer {key}"}, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        ids = [str(m.get("id") or "") for m in (data.get("data") or [])]
+        return sorted({i for i in ids if i and not i.startswith("text-embedding") and i not in ("Embedding",)})
+    except Exception:
+        # 离线兜底：与 litellm_config 常用组对齐
+        return ["GwV4F", "Gwglm5.3", "claude-model", "codex-model", "agnes-text", "DV4F", "QV4F", "QW3.8F"]
+
+
 def agent_models():
-    """从 opencode.json providers 列出可选模型（provider/model）"""
+    """从 opencode.json providers 列出可选模型（provider/model）。
+
+    litellm 的 opencode.json 里 models 常为空（靠上游 /v1/models 自动发现），
+    以前会显示成 litellm/* —— 设置页看不出真实可用模型。现改为：
+    1) litellm → 实拉本机 :4000 的模型清单；
+    2) 其它 provider 有 models 就枚举，空 models 且非关键 provider 则跳过（不再刷 */*）；
+    3) 当前正在用的 model 一定并进列表，避免「当前 litellm/GwV4F」不在选项里。
+    """
     import json as _json
     try:
         with open(OPENCODE_CFG, encoding="utf-8") as f:
             cfg = _json.load(f)
     except Exception:
         return {"ok": True, "models": []}
+    current = (cfg.get("model") or "").strip()
+    # 各 agent 段也可能各配模型，一并并入
+    current_set = {current} if current else set()
+    for a in (cfg.get("agent") or {}).values():
+        m = (a or {}).get("model") or ""
+        if m:
+            current_set.add(m)
+
     models = []
     for pid, pv in (cfg.get("provider") or {}).items():
         mlist = pv.get("models") or {}
+        if pid == "litellm":
+            models += [f"litellm/{m}" for m in _litellm_model_ids()]
+            continue
         if mlist:
             models += [f"{pid}/{m}" for m in mlist]
-        else:
-            models.append(f"{pid}/*")
-    return {"ok": True, "models": sorted(models)}
+        # 空 models 的旁路 provider（volcark/gw 等）不再显示 litellm/* 占位
+    models += [m for m in current_set if m]
+    # 去重排序
+    return {"ok": True, "models": sorted(set(models))}
 
 
 def mc_has_answer(query):
@@ -430,40 +464,276 @@ def api_models():
     data = r.json().get("data", [])
     return {"ok": True, "models": sorted([m.get("id") for m in data if m.get("id")])}
 
-# ── 记忆治理流水线（扫库出计划 → agent 交叉验证 → 老大批准 → 执行 → 终验）──
+# ── 记忆治理流水线（扫库 → 后台 job 合并/归档 → 终验）──
+# 2026-09-17 重做：一键不再绑浏览器 SSE；小条目激进合并；快照按标题指纹防误伤
 
-def gov_scan():
-    """① 扫库：找可疑记忆。纯只读算法，产出治理计划草案。
-    范围控制：agent-matrix 快照类（同 source 整段重导）按"只留每 source 最新"处理；
-    其他记忆做 BGE>0.92 相似簇。零引用单独列出（本轮不动）"""
+_GOV_JOB = {"running": False, "job_id": None, "phase": "", "log": [],
+            "started": None, "finished": None, "result": None}
+
+
+def _gov_log(msg):
+    _GOV_JOB["log"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+    if len(_GOV_JOB["log"]) > 80:
+        del _GOV_JOB["log"][:40]
+    print(f"[govern] {msg}", flush=True)
+
+
+_GOV_BACKUP_DIR = "C:/D/opt/openmem/_gov_backup"
+_GOV_KEEP_BACKUPS = 1  # 只保留最近 N 次治理备份
+
+
+def _gov_prune_backups(keep=None):
+    """清理治理备份目录：只保留最近 keep 份（默认 1），其余删除。"""
+    keep = _GOV_KEEP_BACKUPS if keep is None else max(1, int(keep))
+    root = _GOV_BACKUP_DIR
+    if not os.path.isdir(root):
+        return 0
+    files = [f for f in os.listdir(root) if f.endswith(".json")]
+    files.sort(key=lambda n: os.path.getmtime(os.path.join(root, n)), reverse=True)
+    removed = 0
+    for name in files[keep:]:
+        try:
+            os.remove(os.path.join(root, name))
+            removed += 1
+        except OSError:
+            pass
+    # 顺手清掉手扫残留（只留最新 scan/verify）
+    for pattern_dir, patterns in (
+        (os.path.dirname(root), ("_gov_manual_scan", "_gov_manual_verify")),
+    ):
+        for pref in patterns:
+            hits = [f for f in os.listdir(pattern_dir) if f.startswith(pref) and f.endswith(".json")]
+            hits.sort(key=lambda n: os.path.getmtime(os.path.join(pattern_dir, n)), reverse=True)
+            for name in hits[1:]:
+                try:
+                    os.remove(os.path.join(pattern_dir, name))
+                    removed += 1
+                except OSError:
+                    pass
+    # TMP gov 脚本：只留最新一组
+    tmp = os.environ.get("TEMP") or os.environ.get("TMP") or ""
+    if tmp:
+        gov_tmp = [f for f in os.listdir(tmp) if f.startswith("gov_") and f.endswith(".py")]
+        gov_tmp.sort(key=lambda n: os.path.getmtime(os.path.join(tmp, n)), reverse=True)
+        for name in gov_tmp[1:]:
+            try:
+                os.remove(os.path.join(tmp, name))
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def _gov_write_backup(plan, mode):
+    """执行前把将动的条目原文落到滚动备份目录。
+    空计划不写备份、不 prune——避免空跑把上一份有效备份冲掉。"""
+    n_m = len(plan.get("merges") or [])
+    n_c = len(plan.get("clusters") or [])
+    n_s = len(plan.get("snapshots") or [])
+    if n_m + n_c + n_s == 0:
+        _gov_log("无待动条目，跳过备份与清理")
+        return None
+    os.makedirs(_GOV_BACKUP_DIR, exist_ok=True)
+    ids = []
+    for item in (plan.get("merges") or []) + (plan.get("clusters") or []) + (plan.get("snapshots") or []):
+        ids.append(item.get("keep"))
+        ids.extend(item.get("archive") or [])
+    ids = [i for i in ids if i]
+    # 去重保序
+    seen, uniq = set(), []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            uniq.append(i)
+    rows = _entry_rows_full(uniq) if uniq else []
+    entries = []
+    for e in rows:
+        emb = e.pop("emb", None)
+        entries.append({
+            **e,
+            "embedding": (emb.tolist() if hasattr(emb, "tolist") else emb),
+            "created": e["created"].isoformat() if hasattr(e.get("created"), "isoformat") else e.get("created"),
+        })
+    if not entries:
+        _gov_log("计划有组但读不到原文，跳过备份")
+        return None
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(_GOV_BACKUP_DIR, f"gov-{ts}-{_GOV_JOB.get('job_id') or 'na'}-{mode}.json")
+    payload = {
+        "created": ts,
+        "job_id": _GOV_JOB.get("job_id"),
+        "mode": mode,
+        "entry_count": len(entries),
+        "entries": entries,
+        "plan_summary": _GOV_JOB.get("plan_summary"),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    pruned = _gov_prune_backups()
+    _gov_log(f"已备份 {len(entries)} 条原文 → {os.path.basename(path)}（清理旧备份 {pruned} 个）")
+    return path
+
+
+def _title_key(content, n=48):
+    """条目标题指纹：用于 agent-matrix 重导分组，避免同 category 不同服务被当成快照"""
+    t = (content or "").strip().splitlines()[0] if content else ""
+    t = t.strip("《》#* ").strip()
+    return t[:n]
+
+
+def _entry_rows_full(ids):
+    if not ids:
+        return []
+    ph = ",".join(["%s"] * len(ids))
+    rows = db_query(f"""SELECT id, layer, category, source, content, tags, pinned, confidence,
+                        created_at, embedding FROM memory_entries
+                        WHERE id IN ({ph}) AND superseded_by IS NULL""", tuple(ids))
+    out = {}
+    for r in rows:
+        emb = None
+        try:
+            e = r[9]
+            import numpy as np
+            emb = np.array([float(x) for x in
+                            (e if isinstance(e, list) else str(e).strip("{}").split(","))],
+                           dtype=np.float32)
+        except Exception:
+            emb = None
+        out[str(r[0])] = {
+            "id": str(r[0]), "layer": r[1], "category": r[2], "source": r[3],
+            "content": r[4] or "", "tags": r[5] or [], "pinned": bool(r[6]),
+            "confidence": r[7], "created": r[8], "emb": emb,
+        }
+    return [out[i] for i in ids if i in out]
+
+
+def gov_ai_review(plan, max_per_batch=8):
+    """AI 审核：对每组 merge/archive 候选读全文（截断）后判定 ✅/⚠️/❌。
+    只用 openmem 主模型 llm_chat（纯 API），不依赖浏览器/研究智能体进程。
+    返回过滤后的 plan + review 日志。"""
+    items = []
+    for kind, group in (("merge", plan.get("merges") or []),
+                        ("archive", plan.get("clusters") or [])):
+        for it in group:
+            items.append({**it, "kind": kind})
+    # snapshots 不经 AI（真快照），仍执行
+    if not items:
+        return plan, ["无 merge/archive 候选，跳过 AI 审核"]
+
+    logs = []
+    approved_m, approved_a = [], []
+    # 逐组送审（每组最多 2 条全文片段）
+    for i, it in enumerate(items, 1):
+        keep_id = it.get("keep")
+        arch_ids = it.get("archive") or []
+        rows = _entry_rows_full([keep_id] + arch_ids)
+        by = {r["id"]: r for r in rows}
+        keep = by.get(keep_id)
+        if not keep:
+            logs.append(f"[{i}] keep 丢失，拒绝")
+            continue
+        def snippet(r, n=900):
+            return (r["content"] or "")[:n]
+        lines = [f"组{i} kind={it.get('kind')} sim={it.get('sim')}"]
+        lines.append(f"KEEP({keep_id[:8]}): {snippet(keep)}")
+        for aid in arch_ids:
+            ar = by.get(aid)
+            lines.append(f"FROM({aid[:8]}): {snippet(ar) if ar else '(missing)'}")
+        prompt = (
+            "你是记忆库治理审计员。判断候选条目是否应并入/归档到 KEEP。\n"
+            "规则：\n"
+            "1) ✅允许：候选是 KEEP 的旧版/子集/同一事实换说法，信息不丢。\n"
+            "2) ⚠️拒绝：主题相关但流程/阶段不同（例如旧手动流程 vs 新自动流程），并入会混操作步骤。\n"
+            "3) ❌拒绝：不同主题、独立事实、或并入会丢关键细节。\n"
+            "只输出一行：第{i}组 ✅ 或 第{i}组 ⚠️ 或 第{i}组 ❌，可跟半句理由。\n\n"
+            + "\n".join(lines)
+        ).replace("{i}", str(i))
+        try:
+            verdict = (mc.llm_chat([
+                {"role": "system", "content": "只按格式输出判定行，不要解释多段。"},
+                {"role": "user", "content": prompt},
+            ], max_tokens=80, timeout=90) or "").strip()
+        except Exception as e:
+            logs.append(f"[{i}] AI 调用失败，保守拒绝：{e}")
+            continue
+        logs.append(f"[{i}] {verdict[:120]}")
+        first = ""
+        for ch in ("✅", "⚠️", "❌", "⚠", "?"):
+            if ch in verdict:
+                first = "✅" if ch == "✅" else "reject"
+                break
+        if first == "✅" and it.get("kind") == "merge":
+            approved_m.append(it)
+        elif first == "✅" and it.get("kind") == "archive":
+            approved_a.append(it)
+        # 拒绝的丢弃，不进执行
+
+    out = {
+        **plan,
+        "merges": approved_m,
+        "clusters": approved_a,
+        # snapshots 原样保留（真快照不经 AI）
+        "ai_approved_merges": len(approved_m),
+        "ai_approved_archives": len(approved_a),
+        "ai_rejected": len(items) - len(approved_m) - len(approved_a),
+    }
+    logs.append(f"AI 通过：merge {len(approved_m)} / archive {len(approved_a)}；拒绝 {out['ai_rejected']}")
+    return out, logs
+
+
+def gov_merge_contents(primary, extras):
+    """把 extras 里 primary 没有的段落并进 primary；按段落去重。"""
+    def paras(text):
+        return [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    primary_p = paras(primary)
+    seen = set(p[:120] for p in primary_p)
+    out = list(primary_p)
+    for ex in extras:
+        for p in paras(ex):
+            key = p[:120]
+            if key in seen:
+                continue
+            # 子串被主条覆盖则跳过
+            if any(p in q or q in p for q in seen if len(q) > 40):
+                continue
+            seen.add(key)
+            out.append(p)
+    return "\n\n".join(out)
+
+
+def gov_scan_aggressive(threshold_large=0.92, threshold_small=0.88, small_len=500):
+    """扫库：真快照 + 语义簇 + 小条合并组。只读。"""
     import numpy as np
     rows = db_query("""SELECT id, layer, category, source, content, embedding, pinned, created_at
                        FROM memory_entries WHERE superseded_by IS NULL ORDER BY created_at DESC""")
     if not rows:
-        return {"clusters": [], "snapshots": [], "stale": [], "total": 0}
+        return {"clusters": [], "merges": [], "snapshots": [], "stale": [], "total": 0}
     meta = []
     for r in rows:
         meta.append({"id": str(r[0]), "layer": r[1], "category": r[2], "source": r[3],
-                     "content": r[4][:150], "pinned": r[6],
-                     "created": r[7].isoformat()[:10] if r[7] else ""})
-    # A. 同源快照：agent-matrix 服务明细类，同 (source, category) 只留最新一条
+                     "content": r[4] or "", "preview": (r[4] or "")[:150],
+                     "pinned": r[6], "created": r[7].isoformat()[:19] if r[7] else "",
+                     "title": _title_key(r[4])})
+
+    # A. agent-matrix 真快照：同 (category, title_key) 多版本 → 留最新
     snapshots = []
-    groups = {}
-    for m in meta:  # 时间倒序，首个即最新
+    snap_groups = {}
+    for m in meta:
         if m["source"] != "agent-matrix" or m["pinned"]:
             continue
-        key = m["category"]
-        groups.setdefault(key, []).append(m)
-    for key, ms in groups.items():
+        k = (m["category"], m["title"])
+        snap_groups.setdefault(k, []).append(m)
+    snap_ids = set()
+    for (cat, title), ms in snap_groups.items():
         if len(ms) > 1:
-            snapshots.append({"keep": ms[0]["id"], "archive": [m["id"] for m in ms[1:]],
-                              "source": key, "count": len(ms) - 1,
-                              "sample": ms[0]["content"][:80]})
-    # B. 语义相似簇：排除 agent-matrix 快照类，只看有 embedding 的普通记忆
-    normal = [m for m in meta if m["source"] != "agent-matrix"]
-    snap_ids = {m["id"] for ms in groups.values() for m in ms}
-    normal_ids = {m["id"] for m in normal if m["id"] not in snap_ids} if False else None
-    # 重新取这些条目的 embedding
+            snapshots.append({
+                "keep": ms[0]["id"], "archive": [m["id"] for m in ms[1:]],
+                "source": cat, "title": title, "count": len(ms) - 1,
+                "sample": ms[0]["preview"][:80]})
+            snap_ids.update(m["id"] for m in ms)
+
+    # B/C. 普通记忆
+    normal = [m for m in meta if m["source"] != "agent-matrix" and m["id"] not in snap_ids and not m["pinned"]]
     emap = {}
     if normal:
         ph = ",".join(["%s"] * len(normal))
@@ -476,30 +746,59 @@ def gov_scan():
                                           dtype=np.float32)
             except Exception:
                 continue
-    idxs = [i for i, m in enumerate(normal) if m["id"] in emap and not m["pinned"]]
-    clusters, seen = [], set()
+    idxs = [i for i, m in enumerate(normal) if m["id"] in emap]
+    clusters, merges, seen = [], [], set()
     if len(idxs) > 1:
-        ids_list = [normal[i]["id"] for i in idxs]
-        mat = np.stack([emap[i] for i in ids_list])
+        mat = np.stack([emap[normal[i]["id"]] for i in idxs])
         norms = np.array([np.linalg.norm(v) + 1e-9 for v in mat])
         sim = mat @ mat.T / (norms[:, None] * norms[None, :])
         for a in range(len(idxs)):
-            mi = normal[idxs[a]]
-            if mi["id"] in seen or mi["pinned"]:
+            ma = normal[idxs[a]]
+            if ma["id"] in seen:
                 continue
-            group = [b for b in range(a + 1, len(idxs))
-                     if sim[a][b] > 0.92 and normal[idxs[b]]["id"] not in seen]
-            if group:
-                ids = [mi["id"]] + [normal[idxs[b]]["id"] for b in group]
-                seen.update(ids)
-                clusters.append({
-                    "keep": mi["id"],
-                    "archive": [normal[idxs[b]]["id"] for b in group],
-                    "sim": round(float(max(sim[a][b] for b in group)), 3),
-                    "sample": mi["content"],
-                    "members": [{"id": normal[idxs[b]]["id"], "content": normal[idxs[b]]["content"],
-                                 "created": normal[idxs[b]]["created"]} for b in [a] + group]})
-    # C. 30 天零引用（本轮仅展示）
+            len_a = len(ma["content"])
+            thr = threshold_small if len_a < small_len else threshold_large
+            group = []
+            for b in range(a + 1, len(idxs)):
+                mb = normal[idxs[b]]
+                if mb["id"] in seen:
+                    continue
+                len_b = len(mb["content"])
+                thr_b = threshold_small if (len_a < small_len or len_b < small_len) else threshold_large
+                t = min(thr, thr_b)
+                if sim[a][b] > t:
+                    group.append(b)
+            if not group:
+                continue
+            members_idx = [a] + group
+            ids = [normal[idxs[x]]["id"] for x in members_idx]
+            seen.update(ids)
+            # keep = 最长内容；相同长度取更新的
+            best = max(members_idx, key=lambda x: (len(normal[idxs[x]]["content"]),
+                                                   normal[idxs[x]]["created"]))
+            keep = normal[idxs[best]]["id"]
+            archive = [i for i in ids if i != keep]
+            max_sim = round(float(max(sim[a][b] for b in group)), 3)
+            # 小条为主 → 合并模式；否则归档模式
+            primary_len = len(normal[idxs[best]]["content"])
+            is_merge = (primary_len < 1200) or (max_sim >= threshold_small and primary_len < 2000)
+            item = {
+                "keep": keep, "archive": archive, "sim": max_sim,
+                "sample": normal[idxs[best]]["content"][:100],
+                "mode": "merge" if is_merge else "archive",
+                "members": [{
+                    "id": normal[idxs[x]]["id"],
+                    "content": normal[idxs[x]]["content"][:300],
+                    "created": normal[idxs[x]]["created"],
+                    "title": normal[idxs[x]]["title"],
+                } for x in members_idx],
+            }
+            if is_merge:
+                merges.append(item)
+            else:
+                clusters.append(item)
+
+    # 30 天零引用（展示）
     hot = db_query("""SELECT refs::text, count(*) FROM ask_log
                       WHERE created_at > now() - interval '30 days' GROUP BY refs""")
     counts = {}
@@ -509,11 +808,177 @@ def gov_scan():
                 counts[str(rid)] = counts.get(str(rid), 0) + 1
         except Exception:
             continue
-    stale = [{"id": m["id"], "content": m["content"], "category": m["category"],
+    stale = [{"id": m["id"], "content": m["preview"], "category": m["category"],
               "created": m["created"]}
              for m in meta if not m["pinned"] and counts.get(m["id"], 0) == 0
-             and "实地查证" not in m["category"]][:40]
-    return {"clusters": clusters, "snapshots": snapshots, "stale": stale, "total": len(meta)}
+             and "实地查证" not in (m["category"] or "")][:40]
+    return {
+        "clusters": clusters, "merges": merges, "snapshots": snapshots,
+        "stale": stale, "total": len(meta),
+        "threshold_large": threshold_large, "threshold_small": threshold_small,
+    }
+
+
+def gov_scan():
+    """兼容旧调用：走激进扫库，仍返回 clusters/snapshots/stale，并附 merges"""
+    return gov_scan_aggressive()
+
+
+def gov_execute_aggressive(plan, mode="safe"):
+    """执行：merges 合并写回；clusters/snapshots 软归档。
+    计划若已 AI 审核过滤（只含通过项），mode 主要影响是否再卡 sim 阈值。"""
+    done_m, done_a, skip = [], [], []
+    reviewed = plan.get("ai_approved_merges") is not None or plan.get("ai_rejected") is not None
+
+    def can(aid):
+        rows = db_query("SELECT id, pinned FROM memory_entries WHERE id=%s AND superseded_by IS NULL",
+                        (aid,), fetch="one")
+        return bool(rows) and not rows[1]
+
+    # merges
+    for item in plan.get("merges") or []:
+        # AI 已审通过则不再按 sim 卡；未审时 safe 才卡 0.93
+        if (not reviewed) and mode == "safe" and item.get("sim", 0) < 0.93:
+            skip.append({"id": item.get("keep"), "reason": f"safe 跳过 sim={item.get('sim')}"})
+            continue
+        keep = item.get("keep")
+        archives = item.get("archive") or []
+        if not can(keep):
+            skip.append({"id": keep, "reason": "keep 不可用"})
+            continue
+        members = _entry_rows_full([keep] + archives)
+        by = {m["id"]: m for m in members}
+        if keep not in by:
+            skip.append({"id": keep, "reason": "keep 丢失"})
+            continue
+        extras = [by[a]["content"] for a in archives if a in by]
+        merged = gov_merge_contents(by[keep]["content"], extras)
+        # 重算向量
+        try:
+            vec = mc.emb([merged])[0]
+        except Exception as e:
+            skip.append({"id": keep, "reason": f"embed 失败 {e}"[:80]})
+            continue
+        conn = mc.connect(); cur = conn.cursor()
+        cur.execute("""UPDATE memory_entries
+                       SET content=%s, embedding=%s, embedding_v=%s::vector, updated_at=now()
+                       WHERE id=%s""",
+                    (merged, vec, vec, keep))
+        for a in archives:
+            if can(a):
+                cur.execute("UPDATE memory_entries SET superseded_by=%s WHERE id=%s", (keep, a))
+                done_a.append({"archived": a, "kept": keep, "via": "merge"})
+        conn.commit(); cur.close(); conn.close()
+        done_m.append({"kept": keep, "merged_from": archives, "chars": len(merged), "sim": item.get("sim")})
+
+    # clusters + snapshots → soft archive
+    for item in list(plan.get("clusters") or []) + list(plan.get("snapshots") or []):
+        if mode == "safe" and item.get("sim", 1) is not None and "sim" in item and item.get("sim", 1) < 0.93:
+            # snapshots 无 sim，默认执行
+            if "sim" in item:
+                skip.append({"id": item.get("keep"), "reason": f"safe 跳过 sim={item.get('sim')}"})
+                continue
+        keep = item.get("keep")
+        for a in item.get("archive") or []:
+            if not can(a):
+                skip.append({"id": a, "reason": "不存在/已钉住/已归档"})
+                continue
+            conn = mc.connect(); cur = conn.cursor()
+            cur.execute("UPDATE memory_entries SET superseded_by=%s WHERE id=%s", (keep, a))
+            conn.commit(); cur.close(); conn.close()
+            done_a.append({"archived": a, "kept": keep, "via": "cluster" if "sim" in item else "snapshot"})
+    return {"merged": done_m, "archived": done_a, "skipped": skip}
+
+
+def _gov_job_worker(plan, mode):
+    global _GOV_JOB
+    try:
+        _GOV_JOB["phase"] = "review"
+        _gov_log("AI 审核中（纯 llm_chat，逐组判 ✅/⚠️/❌）…")
+        reviewed, review_logs = gov_ai_review(plan)
+        for line in review_logs:
+            _gov_log(line)
+        plan = reviewed
+        _GOV_JOB["phase"] = "merge"
+        _gov_log(f"审核后执行 mode={mode} merges={len(plan.get('merges') or [])} "
+                 f"clusters={len(plan.get('clusters') or [])} snaps={len(plan.get('snapshots') or [])}")
+        r = gov_execute_aggressive(plan, mode=mode)
+        after = db_query("SELECT count(*) FROM memory_entries WHERE superseded_by IS NULL", fetch="one")[0]
+        archived_total = db_query("SELECT count(*) FROM memory_entries WHERE superseded_by IS NOT NULL", fetch="one")[0]
+        _GOV_JOB["phase"] = "done"
+        _GOV_JOB["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        _GOV_JOB["result"] = {
+            **r,
+            "active_after": after,
+            "archived_total": archived_total,
+            "merged_n": len(r.get("merged") or []),
+            "archived_n": len(r.get("archived") or []),
+        }
+        _gov_log(f"完成：合并 {len(r.get('merged') or [])} 组，归档 {len(r.get('archived') or [])} 条")
+    except Exception as e:
+        _GOV_JOB["phase"] = "error"
+        _GOV_JOB["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        _GOV_JOB["result"] = {"error": str(e)}
+        _gov_log(f"失败：{e}")
+    finally:
+        _GOV_JOB["running"] = False
+        try:
+            with open("C:/D/opt/openmem/_govern_report.json", "w", encoding="utf-8") as f:
+                json.dump(_GOV_JOB.get("result") or {}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
+def gov_start_job(mode="safe", threshold_small=None):
+    """启动后台治理 job（非阻塞）。返回 job_id。"""
+    global _GOV_JOB
+    if _GOV_JOB.get("running"):
+        return {"ok": False, "error": "已有治理任务在跑", "job_id": _GOV_JOB.get("job_id")}
+    import threading
+    _GOV_JOB.update({
+        "running": True, "job_id": str(uuid.uuid4())[:8],
+        "phase": "scan", "log": [], "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "finished": None, "result": None,
+    })
+    _gov_log(f"启动 mode={mode}")
+
+    def run():
+        try:
+            _gov_log("扫库中…")
+            if threshold_small:
+                plan = gov_scan_aggressive(threshold_small=float(threshold_small))
+            else:
+                plan = gov_scan_aggressive()
+            _GOV_JOB["plan_summary"] = {
+                "total": plan.get("total"),
+                "merges": len(plan.get("merges") or []),
+                "clusters": len(plan.get("clusters") or []),
+                "snapshots": len(plan.get("snapshots") or []),
+                "stale": len(plan.get("stale") or []),
+            }
+            _gov_log(f"计划：合并组 {len(plan.get('merges') or [])}，归档簇 "
+                     f"{len(plan.get('clusters') or [])}，快照 {len(plan.get('snapshots') or [])}")
+            try:
+                _gov_write_backup(plan, mode)
+            except Exception as e:
+                _gov_log(f"备份失败（继续执行）：{e}")
+            _GOV_JOB["phase"] = "execute"
+            _gov_job_worker(plan, mode)
+        except Exception as e:
+            _GOV_JOB["running"] = False
+            _GOV_JOB["phase"] = "error"
+            _GOV_JOB["result"] = {"error": str(e)}
+            _gov_log(f"worker 异常：{e}")
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return {"ok": True, "job_id": _GOV_JOB["job_id"], "running": True}
+
+
+def gov_job_status():
+    st = dict(_GOV_JOB)
+    st["running"] = bool(st.get("running"))
+    return st
 
 
 def _gov_verify_task(plan):
@@ -759,38 +1224,32 @@ def api_tool_create(name, description="", prompt="", interval="1 day"):
         return {"ok": False, "error": "内核输出无法解析", "raw": buf.getvalue()[-500:]}
 
 def api_onboarding():
-    """入职包：新 agent 一条命令拉全。pinned l0 + 坑库Top + 服务端口 + 工具清单 + 接入方式"""
-    pinned = db_query("""SELECT source, content, created_at FROM memory_entries
-                         WHERE pinned AND superseded_by IS NULL ORDER BY layer, created_at DESC LIMIT 40""")
-    pits = db_query("""SELECT source, content FROM memory_entries
-                       WHERE layer='m' AND category='lessons' AND superseded_by IS NULL
-                       ORDER BY pinned DESC, created_at DESC LIMIT 20""")
-    tools = db_query("SELECT name, description FROM preset_tools WHERE enabled ORDER BY name")
-    lines = ["# 📦 openmem 入职包（新 agent 一条命令拉全）",
-             "> 生成时间：" + __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M"),
-             "",
-             "## 接入方式（装完即老手）",
-             "```json",
-             '{"mcpServers": {"openmem": {"url": "http://127.0.0.1:3466/mcp"}}}',
-             "```",
-             "MCP 工具：`mh_write`(写入，source强制) / `mh_search`(混合检索) / `mh_ask`(AI对AI咨询) / `mh_tool`(预生成答案秒回) / `mh_status`",
-             "",
-             "## 一、老大是谁（钉住的关键事实）"]
-    for src, content, _ in pinned:
-        lines.append(f"- **[{src}]** {content}")
-    lines += ["", "## 二、血泪坑库 Top（l2，动手前必读）"]
-    for src, content in pits:
-        lines.append(f"- **[{src}]** {content[:400]}")
-    lines += ["", "## 三、标准化答案工具（要这类信息直接 mh_tool 秒取）"]
-    for name, desc in tools:
-        lines.append(f"- **{name}**：{desc}")
-    lines += ["", "## 四、铁律摘要",
-              "- 修 bug ≠ 加功能，没提的功能一行不许加",
-              "- 破坏性操作（删/改配置/重启服务）必须先问 + 先备份 `*.bak-<时间戳>`",
-              "- 报状态必须当场实测，禁止拿旧观察当现状",
-              "- 动 litellm（被 11 bot 依赖）前必须问老大",
-              "- 重要结论不写回 openmem 不算任务完成"]
-    return {"markdown": "\n".join(lines)}
+    """入职包 v2（2026-09-15 老大拍板）：≤15 行路标版，不再全文倾倒。
+    新人拿到后的动作 = 把路标誊进自己的人设/记忆文件，下次带记忆入职。
+    细节不删记忆——pinned/坑库/手册全在库里，当第二跳按需 mh_search。"""
+    try:
+        n_mem = db_query("SELECT count(*) FROM memory_entries WHERE superseded_by IS NULL")[0][0]
+        n_tool = db_query("SELECT count(*) FROM preset_tools WHERE enabled")[0][0]
+    except Exception:
+        n_mem, n_tool = '?', '?'
+    now = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M")
+    md = chr(10).join([
+        "# 📦 openmem 入职包（15 行路标版）",
+        f"> {now} · 库里 {n_mem} 条现役记忆 / {n_tool} 个成品答案。细节都在库里，本包只教怎么拿。",
+        "",
+        '1. **接入**：MCP 配置加一行 `{"url": "http://127.0.0.1:3466/mcp"}`，工具即全（tools/list 自查）',
+        '2. **标准问题先吃成品**：`mh_tools_list` 看清单 → `mh_tool("老大的服务与端口")` 这类秒回，别自己搜',
+        '3. **历史/坑查原文**：`mh_search(query)` 拿原始条目；碰 GitHub/外部 API 前先搜访问方法（如 "GitHub 凭据"），限流多半是没走通道',
+        "4. **要综合判断**：`mh_ask` 以老大口吻现嚼（走 LLM，慢，人问或标准答案没覆盖才用）",
+        "5. **服务/端口专用**：`mh_service(name=)` 精确查 nssm 台账，语义检索查不准它",
+        "6. **收工必写回**：`mh_write(content, source=你的名字)`——重要结论不写回 = 任务没完成",
+        "7. **铁律**：修 bug ≠ 加功能；破坏性操作先问 + 先备份；报状态必须当场实测；编号指代不明先复述确认",
+        "8. **写完刷**：改完环境回头 mh_update 刷旧条目 + mh_tool force_refresh，别让下一条记忆过期",
+        "",
+        "**最后一步（真正的入职）**：把 2-8 誊进你自己的持久记忆/人设文件（如 MEMORY.md），",
+        "以后带记忆上班，不必再拉本包。查不到再拉，拉了就要落地。",
+    ])
+    return {"markdown": md}
 
 
 # ── HTTP 服务 ─────────────────────────────────────────────
@@ -856,27 +1315,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"enabled": get_app_config_flag("research_enabled", True),
                                  **agent_status()})
             elif p == "/api/govern/scan":
-                # ① 扫库出计划（纯只读）
-                self._send(200, gov_scan())
+                # ① 扫库出计划（纯只读，激进合并版）
+                thr = g("threshold_small")
+                self._send(200, gov_scan_aggressive(
+                    threshold_small=float(thr) if thr else 0.88))
+            elif p == "/api/govern/job":
+                self._send(200, gov_job_status())
             elif p == "/api/govern/status":
-                # 分批治理进度（读批处理脚本落的账本）
+                # 后台 job 优先；兼容旧 CLI 账本
                 import os as _os
-                out = {"running": False, "rounds": [], "archived_total": 0, "finished": False}
+                out = gov_job_status()
+                out.setdefault("rounds", [])
+                out.setdefault("archived_total", 0)
+                out.setdefault("finished", not out.get("running") and out.get("phase") == "done")
                 try:
                     rp = "C:/D/opt/openmem/_govern_report.json"
-                    if _os.path.exists(rp):
+                    if _os.path.exists(rp) and not out.get("running"):
                         with open(rp, encoding="utf-8") as f:
-                            out.update(json.load(f))
-                    lg = "C:/D/opt/openmem/_govern_batch.log"
-                    if _os.path.exists(lg):
-                        with open(lg, encoding="utf-8", errors="replace") as f:
-                            out["log_tail"] = f.read()[-600:]
-                    # 还在跑吗：日志 90 秒内有更新视为运行中
-                    if _os.path.exists(lg) and time.time() - _os.path.getmtime(lg) < 90:
-                        out["running"] = True
-                    if _os.path.exists(rp) and "active_after" in out:
-                        out["finished"] = True
-                        out["running"] = False
+                            rep = json.load(f)
+                        if not out.get("result"):
+                            out["result"] = rep
+                        if rep.get("archived_total") is not None:
+                            out["archived_total"] = rep.get("archived_total")
                 except Exception:
                     pass
                 self._send(200, out)
@@ -979,6 +1439,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, api_absorb(body.get("content", ""), body.get("category"),
                                            body.get("tags"), body.get("layer", "m"),
                                            body.get("pinned", False)))
+            elif u.path == "/api/govern/run":
+                # 后台一键治理：扫库→合并/归档，不依赖浏览器保持连接
+                mode = (body.get("mode") or "safe").strip()
+                if mode not in ("safe", "all"):
+                    mode = "safe"
+                thr = body.get("threshold_small")
+                self._send(200, gov_start_job(mode=mode, threshold_small=thr))
             elif u.path == "/api/agent/research":
                 # 手动派研究智能体（用户点按钮才触发，绝不自动查）
                 # 过程实时推送（SSE）：工具层/思考层/文本层全部转发给前端
