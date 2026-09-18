@@ -178,17 +178,13 @@ function createOpenmemServer() {
       } catch (e) { return T(`咨询失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_skill', '【必须先调用】openmem 写入规矩 —— 往 openmem 写记忆（mh_write）前的准入门槛。默认返回**核心写入规矩**（约 800 字符：写入四步 / 三道闸门 / 一句话原则），不走 LLM、秒回；detail="full" 才附完整手册，topic="关键词" 按章节抽段。⚠️ 被写入闸门第 1 关拦下时，调用本工具（**带 agent**）即可放行 —— 不带 agent 不计入你名下、会继续被拦。',
+  s.tool('mh_skill', '【必须先调用】openmem 写入规矩 —— 往 openmem 写记忆（mh_write）前的准入门槛。返回**核心写入规矩**（一页准入条文：写入四步 / 三道闸门 / 一句话原则），不走 LLM、秒回。**没有"完整手册"这回事**（MANUAL.md 已于 2026-09-18 删除 —— 该留的都塞进了各 agent 的 openmem 技能文件）。⚠️ 被写入闸门第 1 关拦下时，调用本工具（**带 agent**）即可放行 —— 不带 agent 不计入你名下、会继续被拦。**票制：领一次只放行一条 —— 写成功这条票就作废，下次再写还得回来再领一次。**',
     {
-      agent: z.string().max(100).optional().describe('你自己的 agent 名（如 claude / codex / mimo / workbuddy）。**必填** —— 闸门靠它记账；不填则第 1 关会继续拦你。'),
-      detail: z.string().optional().describe('full / all / 手册 = 附完整手册 MANUAL.md；默认只给核心规矩'),
-      topic: z.string().optional().describe('按章节标题抽段，如 闸门 / 工具 / Web API')
+      agent: z.string().max(100).optional().describe('你自己的 agent 名（如 claude / codex / mimo / workbuddy / dsh）。**必填** —— 闸门靠它记账；不填则第 1 关会继续拦你。')
     },
     async (p) => {
       try {
         const a = ['skill', '--agent', p.agent || ''];
-        if (p.detail) a.push('--detail', p.detail);
-        if (p.topic) a.push('--topic', p.topic);
         return J(parseCore(await runCore(a)));
       } catch (e) { return T(`领规矩失败: ${e.message}`, true); }
     });
