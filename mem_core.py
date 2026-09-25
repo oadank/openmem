@@ -49,7 +49,10 @@ LLM_KEY = os.environ.get("OPENMEM_LLM_KEY", "")
 LLM_MODEL = os.environ.get("OPENMEM_LLM_MODEL", "GwV4F")
 
 # 检索加权：pinned（权威种子/铁律）条目在 RRF 融合后乘此系数，防止被大量同类条目稀释
-PINNED_BOOST = 1.5
+# [2026-09-19 实测 1.5 → 1.0（关闭加权）] 同一次离线评估：三路融合下加 pinned 让 R@3 从 0.607 掉到 0.512
+# —— 库里 174 条 pinned 中不相关的会被系数顶到正主前面。真要 agent 优先看铁律，应该读结果里的
+# pinned 字段（search 已返回该字段），而不是靠改排名硬塞。要恢复旧行为把这里改回 1.5。
+PINNED_BOOST = 1.0
 # 结构化台账（非经验记忆）默认不进检索池；显式按 source/category 查时放行
 LEDGER_EXCLUDE = "(source='agent-matrix' AND category='services')"
 
@@ -282,8 +285,34 @@ def do_ask_stream(query, requester, history=None, session_id=None, extra_context
 #   旧版用全库共享的 last_handbook_at / last_search_at 判定，是图省 token 的错误折中，已废。
 
 GATE_SEARCH_MIN = 30      # 查重时间窗（分钟）——按 agent 各自算；超窗即拦，无豁免
-GATE_DUP_HI = 0.95        # 相似度红线：≥ 视为重复
 GATE_DUP_SHOW = 3         # 回显相似条数
+# 🔴 相似度三档（2026-09-25 老大令"≥0.7 就得让 AI 自己判断重不重复"→ 先量全库分布再定，别照抄数字）
+#   实测 620 条活跃 / 191890 对：p50=.618  p90=.715  p95=.738  p99=.778  p999=.829  max=.924
+#   ⇒ 旧值 0.95 **在本库永远触发不了**（全库最高一对才 .924）——第③关实际是摆设，
+#     所以才会堆出 0.92 / 0.92 / 0.91 那些"同一件事记两遍"的条（抽查 top12 全是真重复）。
+#   ⇒ 0.70 也不能当红线：≥0.70 有 27527 对，命中即噪音，比不判更糟。
+GATE_DUP_HI = 0.88        # 硬拦：≥ 判为同一件事的第二份记录，只许 mh_update 合并（全库仅 25 对落此档）
+GATE_DUP_ASK = 0.855      # 强制比对：拦一次 + 附老条目首尾原文，逼 AI 读完再判
+#   ↑ 09-25 依存量抽样定档，不是拍脑袋：把灰区 0.80~0.88 最高的 22 对逐对读过 ——
+#     0.80~0.86 多半是【同主题的不同事】（小说"定位升级"vs"第三改主角换人" 0.8755、
+#     litellm 口径终版 vs 事故全记录 0.8664、内存真凶 vs 归因工具坑 0.8698），拦它们纯属误伤；
+#     而 ≥0.855 里几乎全是【同一件事的两个版本】（lark-cli 拒绝绝对路径 0.8761、
+#     claude provider 0.8760、飞书卡片按钮更新 0.8739、协作工作流 v1 vs 最新 0.8665）→ 该拦。
+GATE_DUP_NOTE = 0.84      # 写后提醒：放行，但返回体点名要求自判是否该合并
+#   ↑ 🔴 依据是「新条目 vs 库内最相似一条」的 **max 分布**（620 条实测：p50=.812 p75=.840
+#     p90=.870 p95=.889），不是两两分布（两两 p95 才 .738 —— 拿它当红线是我 09-25 先犯过的错：
+#     照 .75 定档 → 431/620 条命中 = 70% 的写入都弹自查提示，一周后没人再看，等于没有）。
+#     取 .84 ≈ p75：约 25% 的写入会看到提示，覆盖真正可疑的那一段。
+# 🔴 模板族豁免（2026-09-25，补向量当场暴露）：agent-matrix 台账 58 条一旦有了 embedding，
+#   ≥0.88 的对数从 18 暴涨到 492，其中 474 对是【agent-matrix·服务明细 X】两两互像（0.98+）——
+#   37 个服务一条一份、格式同构只差服务名/端口，属**同模板不同实体**，绝不是重复
+#   （合并它们 = 毁掉 mh_service 的台账数据源）。按语义判重在结构化台账上根本站不住，
+#   故这类 category 只认「首行标题一字不差同名」为重复，其余放行。别拿这个当豁免口子的先例。
+#   09-25 补：capabilities 里 agent-matrix·CLI 身份 12 条（每 bot 一条 JSON 身份表）是同一族，
+#   两两 0.88~0.89 互像 6 对 —— 同样是模板同构，一并纳入。但**只对批量导入的 agent-matrix 生效**：
+#   capabilities 里还有 [符号] xxx.json 这类手写条目，不能跟着一起免检。
+GATE_TEMPLATE_CATS = {"services", "capabilities"}
+GATE_TEMPLATE_SOURCE = "agent-matrix"
 
 # 规矩 = 准入条文，精简（RULES.md）—— 闸门要的是"领它这个动作"，不是知识。
 GATE_SKILL_TOOL = "openmem 写入规矩"     # 兼容老路（mh_tool 的名字）；新路 = 独立工具 mh_skill
@@ -522,38 +551,167 @@ def _gate_neighbours(cur, emb_vec, limit=GATE_DUP_SHOW, exclude_id=None):
             for r in cur.fetchall()]
 
 
-def gate_check_dup(cur, source, emb_vec, content):
-    """闸门 ③：库里已有高度相似的条目 → 拦，逼它 mh_update。
+def _gate_peek(cur, eid, span=260):
+    """取某条的首尾原文当比对料。只给 120 字摘要，AI 判不了"一样还是不一样"，只能瞎猜。"""
+    try:
+        cur.execute("SELECT content FROM memory_entries WHERE id=%s::uuid", (eid,))
+        r = cur.fetchone()
+        if not r or not r[0]:
+            return ""
+        c = r[0]
+        if len(c) <= span * 2:
+            return c
+        return c[:span] + "\n     …（中间省略 %d 字）…\n" % (len(c) - span * 2) + c[-span:]
+    except Exception:
+        cur.connection.rollback()
+        return ""
 
-    🔴 内含**安全阀**（09-18 补进文档）：同一版内容被拦过一次后、再交一次即放行 ——
-    防「确实该写却永远过不去」把 agent 卡死。安全阀是防死锁，不是给闸门开口子。
+
+def gate_check_dup(cur, source, emb_vec, content, category=None):
+    """闸门 ③：与库里已有条目太像 → 分档处理（2026-09-25 依全库实测分布重定，见常量区注释）。
+
+      ≥ GATE_DUP_HI  (.88)  硬拦档：几乎同一件事，只许 mh_update 合并
+      ≥ GATE_DUP_ASK (.80)  比对档：**当场拦一次**，把老条目首尾原文拍它脸上要求读完再判；
+                             读完仍认为不同 → 原样再交一次即放行（复用 dup_seen 安全阀，防死锁），
+                             并在条末补 REF 说明两者为何必须并存
+      ≥ GATE_DUP_NOTE(.75)  提醒档：放行，由 cmd_write 写后在返回体里点名让它自判
+
+    🔴 内含**防死锁安全阀**（09-18 补进文档）：同一版内容被拦过一次后、再交一次即放行 ——
+    防「确实该写却永远过不去」把 agent 卡死。安全阀是防卡死，不是给闸门开口子。
     """
     try:
         near = _gate_neighbours(cur, emb_vec, GATE_DUP_SHOW)
     except Exception:
         cur.connection.rollback()
         return None
-    if not near or near[0]["score"] < GATE_DUP_HI:
+    # 模板族（批量导入的台账类）：只认首行标题同名，否则同模板不同实体会被 0.98 误判成重复。
+    # 🔴 必须同时限定 source=GATE_TEMPLATE_SOURCE —— capabilities 里混着手写的 [符号] 条目，
+    #    只按 category 豁免会给它们开免检后门（09-25 差点这么干）。
+    if category in GATE_TEMPLATE_CATS and (source or "").strip() == GATE_TEMPLATE_SOURCE:
+        h = (content or "").split("\n", 1)[0].strip()
+
+        def _same_entity(n):
+            s = (n.get("snippet") or "").split("\n", 1)[0].strip()
+            return bool(s) and (s == h or h.startswith(s) or s.startswith(h))
+
+        near = [n for n in near if _same_entity(n)]
+    if not near:
         return None
+    top = near[0]["score"]
+    if top < GATE_DUP_ASK:
+        return None                                   # 未到拦档；提醒档交给写后 tip
+    hard = top >= GATE_DUP_HI
     rq = _gate_norm(source)
     ag = _gate_agent_get(rq)
     if ag is _GATE_FAIL:
-        return None                    # fail-open
+        return None                                   # fail-open
     h = content_hash(content)[:16]
     seen = list(ag["dup_seen"]) if ag else []
-    if h in seen:                      # 同一版内容坚持要写 → 放行（安全阀）
+    if h in seen:                                     # 同一版内容坚持要写 → 放行（安全阀）
         return None
     seen = (seen + [h])[-30:]
     _gate_sql("""INSERT INTO gate_state (agent, dup_seen, dup_denied) VALUES (%s,%s,1)
                  ON CONFLICT (agent) DO UPDATE SET dup_seen=EXCLUDED.dup_seen,
                    dup_denied=gate_state.dup_denied+1, updated_at=now()""", (rq, seen))
+    nid = near[0]["id"]
+    peek = _gate_peek(cur, nid)
+    if hard:
+        return {
+            "ok": False, "gate": "dup", "denied": True, "tier": "hard",
+            "reason": "写入被拦（第 3 关·硬拦档）：与 %s 相似度 %.2f ≥ %.2f，是同一件事的第二份记录。"
+                      % (nid, top, GATE_DUP_HI),
+            "similar": near, "compare": {nid: peek},
+            "how_to_pass": '别新增。改用 mh_update(id="%s", content="<两条合并后的最新版>") —— 同主题只留一条活条目。' % nid,
+            "note": "若确认不是一回事，原样再交一次即放行（安全阀），但请在条末加 REF: %s 说明为何必须并存。" % nid,
+        }
     return {
-        "ok": False, "gate": "dup", "denied": True,
-        "reason": "写入被拦（第 3 关）：与库里已有条目相似度 %.2f，基本是同一件事。" % near[0]["score"],
-        "similar": near,
-        "how_to_pass": '改用 mh_update(id="%s", content="<合并后的最新版>")。' % near[0]["id"],
-        "note": "确实不是一回事，就把内容写得更具体再交一次。",
+        "ok": False, "gate": "dup", "denied": True, "tier": "ask",
+        "reason": "写入被拦（第 3 关·比对档）：与 %s 相似度 %.2f ≥ %.2f，落在灰区 —— "
+                  "要你亲自判断：是同主题重复（那就合并），还是同主题的不同侧面（那就并存）。" % (nid, top, GATE_DUP_ASK),
+        "similar": near, "compare": {nid: peek},
+        "how_to_pass": '两步，别凭分数猜：① 读完上面 compare 里的老条目原文；'
+                       '② 同主题 → mh_update(id="%s", content="<合并后>")；确属不同 → 原样再交一次即放行，并在末尾补 REF: %s 写清分工。' % (nid, nid),
+        "note": "只拦这一次，目的就是逼你看一眼 —— 不是不让你写。",
     }
+
+
+def cmd_dupcheck(a):
+    """存量重复体检（2026-09-25）：全库两两扫，列出 ≥ --min 的条目对，供人去重。
+    闸门只管新增，存量堆出来的重复靠这条定期清。"""
+    th = float(a.min)
+    conn = connect(); cur = conn.cursor()
+    cur.execute("""
+        SELECT a.id, b.id, 1 - (a.embedding_v <=> b.embedding_v) AS s,
+               a.source, b.source, a.category, b.category,
+               left(split_part(a.content, chr(10), 1), 70) AS ha,
+               left(split_part(b.content, chr(10), 1), 70) AS hb,
+               length(a.content), length(b.content)
+        FROM memory_entries a JOIN memory_entries b ON b.id > a.id
+        WHERE a.superseded_by IS NULL AND b.superseded_by IS NULL
+          AND a.embedding_v IS NOT NULL AND b.embedding_v IS NOT NULL
+          AND 1 - (a.embedding_v <=> b.embedding_v) >= %s
+          AND NOT (a.source = %s AND b.source = %s
+                   AND a.category = ANY(%s) AND b.category = ANY(%s)
+                   AND split_part(a.content, chr(10), 1) <> split_part(b.content, chr(10), 1))
+        ORDER BY s DESC""", (th, GATE_TEMPLATE_SOURCE, GATE_TEMPLATE_SOURCE,
+                             sorted(GATE_TEMPLATE_CATS), sorted(GATE_TEMPLATE_CATS)))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    pairs = [{"a": str(r[0]), "a_head": r[7], "b": str(r[1]), "b_head": r[8],
+              "score": round(float(r[2]), 4),
+              "tier": "hard" if float(r[2]) >= GATE_DUP_HI else ("ask" if float(r[2]) >= GATE_DUP_ASK else "note"),
+              "sources": [r[3], r[4]]} for r in rows]
+    out({"ok": True, "min": th, "count": len(pairs),
+         "thresholds": {"hard": GATE_DUP_HI, "ask": GATE_DUP_ASK, "note": GATE_DUP_NOTE},
+         "pairs": pairs[:int(a.limit)],
+         "truncated": len(pairs) > int(a.limit),
+         "how_to_read": "tier=hard 直接合并（mh_update 保留信息多的那条 id，另一条 supersede 或删）；"
+                        "tier=ask 逐对打开两条读完再判，判不同就补 REF 交叉引用；判不出别看分数瞎合。"})
+
+
+def cmd_deprecate(a):
+    """软删（2026-09-25 补，为存量去重而设）：把一条记忆标记 superseded_by 指向保留条。
+
+    为什么不是硬删：
+      · 记忆总纲写"错的直接删"，但本库 678 条里 superseded_by 历史上一次都没用过，也没有
+        任何 delete 通道 —— 拿裸 SQL DELETE 去清重复，判错一条就永久丢一份原文，不可回滚。
+      · 检索 / 相似度 / 体检 SQL 一律带 `superseded_by IS NULL`（见 _gate_neighbours、cmd_dupcheck），
+        标记后该条即从检索与重复判定中消失，效果等同下线；置回 NULL 就复原（--restore）。
+    用法：
+      python mem_core.py deprecate --id <要下线的短id> --supersede <保留的短id>
+      python mem_core.py deprecate --id <短id> --restore
+    """
+    conn = connect(); cur = conn.cursor()
+    rid, err = resolve_entry_id(cur, a.id)
+    if err:
+        cur.close(); conn.close(); out({"ok": False, "error": err}); return
+    if getattr(a, "restore", False):
+        cur.execute("UPDATE memory_entries SET superseded_by=NULL, updated_at=now() WHERE id=%s::uuid", (rid,))
+        conn.commit()
+        cur.execute("SELECT count(*) FROM memory_entries WHERE superseded_by IS NOT NULL")
+        left = cur.fetchone()[0]
+        cur.close(); conn.close()
+        out({"ok": True, "restored": rid, "still_deprecated": left}); return
+    if not a.supersede:
+        cur.close(); conn.close()
+        out({"ok": False, "error": "必须给 --supersede <保留条id>；本命令只做『合并后下线』，不做无痕删除"}); return
+    tid, terr = resolve_entry_id(cur, a.supersede)
+    if terr:
+        cur.close(); conn.close(); out({"ok": False, "error": "保留条无法解析: " + terr}); return
+    if tid == rid:
+        cur.close(); conn.close(); out({"ok": False, "error": "不能自己指向自己"}); return
+    cur.execute("SELECT left(split_part(content, chr(10), 1), 70), length(content) FROM memory_entries WHERE id=%s::uuid", (rid,))
+    old = cur.fetchone()
+    cur.execute("SELECT left(split_part(content, chr(10), 1), 70), length(content) FROM memory_entries WHERE id=%s::uuid", (tid,))
+    new = cur.fetchone()
+    cur.execute("UPDATE memory_entries SET superseded_by=%s::uuid, updated_at=now() WHERE id=%s::uuid", (tid, rid))
+    conn.commit()
+    cur.execute("SELECT count(*) FROM memory_entries WHERE superseded_by IS NOT NULL")
+    left = cur.fetchone()[0]
+    cur.close(); conn.close()
+    out({"ok": True, "deprecated": rid, "deprecated_head": old[0], "deprecated_len": old[1],
+         "supersede_to": tid, "keeper_head": new[0], "keeper_len": new[1], "total_deprecated": left,
+         "undo": "python mem_core.py deprecate --id %s --restore" % rid[:8]})
 
 
 # ── 写入 / 检索 ───────────────────────────────────────────
@@ -568,7 +726,7 @@ def cmd_write(a):
     if gate:
         cur.close(); conn.close(); out(gate); return
     # ── 写入闸门 ③：与库里已有条目高度雷同 → 逼它去 update
-    dup = gate_check_dup(cur, a.source, emb_vec, a.content)
+    dup = gate_check_dup(cur, a.source, emb_vec, a.content, a.category)
     if dup:
         cur.close(); conn.close(); out(dup); return
 
@@ -601,10 +759,18 @@ def cmd_write(a):
            "cred_masked": _cred_hits}
     if similar:
         res["similar"] = similar
-        if similar[0]["score"] >= 0.85:
-            res["tip"] = ("注意：库里已有相似度 %.2f 的条目（%s）。若属同主题，请改用 "
-                          'mh_update(id="%s", content="<合并后的最新版>")，别再堆第二条。'
-                          % (similar[0]["score"], similar[0]["id"], similar[0]["id"]))
+        _note = [s for s in similar if s["score"] >= GATE_DUP_NOTE]
+        if a.category in GATE_TEMPLATE_CATS and (a.source or "").strip() == GATE_TEMPLATE_SOURCE:
+            # 批量台账族：只有首行同名的才算"疑似重复"
+            _h = (a.content or "").split("\n", 1)[0].strip()
+            _note = [s for s in _note if _h.startswith((s.get("snippet") or "").split("\n", 1)[0].strip())]
+        if _note:
+            res["dup_watch"] = _note
+            res["tip"] = ("🔴 写完必须自查，不许把分数当结论：本条与库里 %d 条相似度 ≥%.2f（最高 %.2f → %s）。"
+                          "请 mh_get 读出它们，逐条判断：【同主题】→ 立刻 mh_update(id=\"%s\") 合并成一条活条目并删掉本条；"
+                          "【确属不同侧面】→ 在本条末尾补一句 REF: <id> 写清两者分工。"
+                          "0.75 以下才是干净新增；灰区（0.80~0.88）判定错了就是以后检索噪音。"
+                          % (len(_note), GATE_DUP_NOTE, _note[0]["score"], _note[0]["id"], _note[0]["id"]))
     out(res)
 
 
@@ -709,6 +875,10 @@ def _filters(a):
     # 默认排除结构化台账（agent-matrix/services，nssm 明细表）；显式指定 source 或 category 时放行
     if not (getattr(a, "source", None) or getattr(a, "category", None)):
         sql += " AND NOT " + LEDGER_EXCLUDE
+    # 🔴 提示词库（layer='p'）与经验记忆彻底分池：默认检索一律排除 p 层，
+    #    只有 mh_pr_* 专用工具显式传 layer='p' 才进得来（照 LEDGER_EXCLUDE 的隔离范式）。
+    if getattr(a, "layer", None) != "p":
+        sql += " AND layer <> 'p'"
     return sql, params
 
 
@@ -791,7 +961,16 @@ def _symbol_top(cur, query, where, params, limit):
     return cur.fetchall()
 
 
-def _rrf(vec_rows, kw_rows, sy_rows=None, k=60, kw_weight=0.85, sy_weight=1.1):
+# [2026-09-19 权重校准 · dsh 离线评估（eval_search.py + eval_set.json，21 条真实查询）]
+# 旧值 k=60 kw_weight=0.85 sy_weight=1.1 → 实测 MRR 0.632 / R@3 0.512
+# 新值 k=20 kw_weight=0.0  sy_weight=0.6  → 实测 MRR 0.976 / R@3 0.881
+# 依据：
+#  · 关键词路(pg_trgm)是"整条比整条"，分数只有 0.02~0.07，与向量(0.6+)/符号(命中个数)量纲不同，
+#    却拿 0.85 权重 → 实测它独家捞进前 8 的候选几乎全是无关长条目，纯灌噪音，故权重归零（通道代码保留，要复活改回 0.85 即可）。
+#  · 符号路(ILIKE)能捞到向量漏掉的精确 token 命中（实测 6142c8d3《视觉域探针·真值+喂法对照》只有它捞出），
+#    但它只数命中词元个数、不看命中质量 → 降到 0.6：保住捞漏、压住噪音。
+#  · k 60→20：RRF 里 k 越小越相信各路头部排名，实测头部命中更吃这个。
+def _rrf(vec_rows, kw_rows, sy_rows=None, k=20, kw_weight=0.0, sy_weight=0.6):
     """Reciprocal Rank Fusion：三路排名融合，天然免疫量纲差异
 
     sy_weight 略高于 kw_weight：符号精确命中是比模糊文本相似更强的信号。
@@ -808,6 +987,8 @@ def _rrf(vec_rows, kw_rows, sy_rows=None, k=60, kw_weight=0.85, sy_weight=1.1):
 
 def _boost_pinned(cur, fused):
     """pinned（权威种子/铁律）条目 RRF 分数 ×PINNED_BOOST，保证地基条目不被海量同类稀释"""
+    if PINNED_BOOST == 1.0:
+        return fused  # 不加权就省掉那次 IN 查询，别白跑一趟库
     ids = [mid for mid, _ in fused]
     if not ids:
         return fused
@@ -1238,7 +1419,7 @@ def main():
     w = sub.add_parser("write")
     w.add_argument("--content", required=True)
     w.add_argument("--source", required=True)
-    w.add_argument("--layer", default="k", choices=["k", "m"])
+    w.add_argument("--layer", default="k", choices=["k", "m", "p"])
     w.add_argument("--category", default="misc")
     w.add_argument("--tags", default="", help="逗号分隔")
     w.add_argument("--confidence", type=float, default=0.5)
@@ -1248,7 +1429,7 @@ def main():
     u = sub.add_parser("update")
     u.add_argument("--id", required=True, help="要更新的条目 id（uuid）")
     u.add_argument("--content", help="新内容；给了就重算 embedding")
-    u.add_argument("--layer", choices=["k", "m"])
+    u.add_argument("--layer", choices=["k", "m", "p"])
     u.add_argument("--category")
     u.add_argument("--source")
     u.add_argument("--tags", help="逗号分隔；给了就整组替换")
@@ -1307,6 +1488,17 @@ def main():
     gt.add_argument("--reset", metavar="SOURCE", help="清某个 agent 的闸门留痕（票 / 搜索时刻 / 拦截计数）")
     gt.add_argument("--reset_all", action="store_true", help="清空全部闸门状态")
     gt.set_defaults(func=cmd_gate)
+
+    dc = sub.add_parser("dupcheck", help="存量重复体检（2026-09-25）：全库两两扫，列出 ≥--min 的条目对")
+    dc.add_argument("--min", default="0.80", help="相似度下限（默认 0.80=比对档；调到 0.75 含提醒档）")
+    dc.add_argument("--limit", default="60", help="最多返回多少对，其余计入 truncated")
+    dc.set_defaults(func=cmd_dupcheck)
+
+    dp = sub.add_parser("deprecate", help="软删（2026-09-25）：标记 superseded_by 指向保留条，可从检索/相似度中消失，--restore 复原")
+    dp.add_argument("--id", required=True, help="要下线的条目 id（短前缀即可）")
+    dp.add_argument("--supersede", help="保留条 id（合并后的活条目）")
+    dp.add_argument("--restore", action="store_true", help="反悔：清掉 superseded_by")
+    dp.set_defaults(func=cmd_deprecate)
 
     sub.add_parser("status").set_defaults(func=cmd_status)
 
