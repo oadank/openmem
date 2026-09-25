@@ -653,9 +653,16 @@ def cmd_dupcheck(a):
           AND NOT (a.source = %s AND b.source = %s
                    AND a.category = ANY(%s) AND b.category = ANY(%s)
                    AND split_part(a.content, chr(10), 1) <> split_part(b.content, chr(10), 1))
+          AND NOT EXISTS (SELECT 1 FROM dup_exempt e
+                          WHERE (e.a = a.id AND e.b = b.id) OR (e.a = b.id AND e.b = a.id))
         ORDER BY s DESC""", (th, GATE_TEMPLATE_SOURCE, GATE_TEMPLATE_SOURCE,
                              sorted(GATE_TEMPLATE_CATS), sorted(GATE_TEMPLATE_CATS)))
     rows = cur.fetchall()
+    cur.execute("SELECT count(*) FROM dup_exempt")
+    try:
+        nex = cur.fetchone()[0]
+    except Exception:
+        nex = 0
     cur.close(); conn.close()
     pairs = [{"a": str(r[0]), "a_head": r[7], "b": str(r[1]), "b_head": r[8],
               "score": round(float(r[2]), 4),
@@ -663,6 +670,9 @@ def cmd_dupcheck(a):
               "sources": [r[3], r[4]]} for r in rows]
     out({"ok": True, "min": th, "count": len(pairs),
          "thresholds": {"hard": GATE_DUP_HI, "ask": GATE_DUP_ASK, "note": GATE_DUP_NOTE},
+         "exempt_ledger": nex,
+         "exempt_note": "已判定「不合并」的条目对记在 dup_exempt 表（含理由与判定人），本次体检已自动跳过它们。"
+                        "要翻案就删掉 dup_exempt 里那行再重跑，别拿体检报告反复看同一批老账。",
          "pairs": pairs[:int(a.limit)],
          "truncated": len(pairs) > int(a.limit),
          "how_to_read": "tier=hard 直接合并（mh_update 保留信息多的那条 id，另一条 supersede 或删）；"
