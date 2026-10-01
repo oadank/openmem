@@ -25,7 +25,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import { spawn } from 'child_process';
 import { createServer } from 'http';
-import { existsSync, readFileSync } from 'fs';
+import { randomUUID } from 'crypto';
+import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -79,6 +80,10 @@ function parseCore(raw) {
 
 const T = (text, isError = false) => ({ content: [{ type: 'text', text }], ...(isError ? { isError } : {}) });
 const J = (obj) => T(JSON.stringify(obj, null, 2));
+
+// wildcards 词库缓存（2026-10-01）：文件加载一次常驻内存，bot 随机抽取秒回。
+// 词库本体在 _local/wildcards/*.txt，与经验记忆/提示词库(layer=p)三方隔离，不进任何检索。
+const WC_CACHE = new Map();
 
 function createOpenmemServer() {
   const s = new McpServer({ name: 'openmem', version: '0.1.0' });
@@ -315,6 +320,35 @@ function createOpenmemServer() {
       catch (e) { return T(`读取失败: ${e.message}`, true); }
     });
 
+  s.tool('mh_pr_random', '【wildcards·随机抽取】从本地 wildcards 素材库（SFW 人像/自拍整段提示词，5500+ 条）随机抽**一条完整提示词**，直接可当生图 prompt 用。与经验记忆/提示词配方库三方隔离（不进库、不进任何检索）。要定向找场景（如"雪地""咖啡馆"）用 mh_pr_search 传 kind="wildcards" 语义搜索。',
+    {
+      file: z.string().max(100).optional().describe('词库文件名（_local/wildcards/ 下，如 sfw_portrait_v3），不给则随机选一个')
+    },
+    async (p) => {
+      try {
+        const dir = join(__dirname, '_local', 'wildcards');
+        if (!existsSync(dir)) return T('wildcards 目录不存在: ' + dir, true);
+        const files = readdirSync(dir).filter(f => f.endsWith('.txt'));
+        if (!files.length) return T('wildcards 目录为空', true);
+        let file;
+        if (p.file) {
+          file = files.find(f => f === p.file || f === p.file + '.txt');
+          if (!file) return T(`词库不存在: ${p.file}（现有: ${files.join(', ')}）`, true);
+        } else {
+          file = files[Math.floor(Math.random() * files.length)];
+        }
+        let lines = WC_CACHE.get(file);
+        if (!lines) {
+          lines = readFileSync(join(dir, file), 'utf8').split(/\r?\n/)
+            .map(t => t.trim()).filter(t => t.length >= 20);
+          WC_CACHE.set(file, lines);
+        }
+        if (!lines.length) return T(`词库为空: ${file}`, true);
+        const idx = Math.floor(Math.random() * lines.length);
+        return J({ ok: true, file, index: idx, total: lines.length, prompt: lines[idx] });
+      } catch (e) { return T(`随机抽取失败: ${e.message}`, true); }
+    });
+
   return s;
 }
 
@@ -339,25 +373,126 @@ function startToolRefresher() {
 async function main() {
   startToolRefresher();
   if (HTTP_PORT) {
+    // ===== 有 session 支持（2026-09-30：openclaw 2026.9.7 的 MCP client 要求 initialize 返回
+    // Mcp-Session-Id，无状态模式会让它 initialize 永远"未完成"而超时。codex/claude/reasonix
+    // 对无状态兼容所以一直没事。改法：带 session id 的请求路由到注册表中的持久实例；不带 id 的
+    // 请求保持原有 per-request 新建实例行为 —— 老客户端零影响。30 分钟无活动清理。=====）
+    const sessions = new Map(); // sessionId -> { server, transport, lastSeen }
+    setInterval(() => {
+      const now = Date.now();
+      for (const [sid, s] of sessions) {
+        if (now - s.lastSeen > 30 * 60 * 1000) {
+          sessions.delete(sid);
+          try { s.transport.close(); } catch {}
+          try { s.server.close(); } catch {}
+        }
+      }
+    }, 10 * 60 * 1000);
+
     const httpServer = createServer(async (req, res) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Mcp-Session-Id');
+      res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS, DELETE');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Mcp-Session-Id, MCP-Protocol-Version');
       if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
       if (req.url !== '/mcp' && !req.url.startsWith('/mcp/')) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not Found. Use POST /mcp'); return;
       }
+
+      const sid = req.headers['mcp-session-id'];
+      console.error(`[http] ${req.method} sid=${sid || '-'} url=${req.url}`);
+
+      // GET 无 session id：openclaw 2026.9.x 的客户端先 GET 开 SSE 流再 initialize，
+      // 有状态 transport 对无 id GET 直接 400。openmem 无服务端推送需求 → 返回合法空 SSE 保活流。
+      if (req.method === 'GET' && !sid) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+        });
+        res.write(': openmem keep-alive (no session; POST /mcp to initialize)\n\n');
+        const keepalive = setInterval(() => {
+          try { res.write(': ka\n\n'); } catch {}
+        }, 25000);
+        req.on('close', () => { clearInterval(keepalive); try { res.end(); } catch {} });
+        return;
+      }
+
+      // 带 session id 且注册表命中 → 复用持久实例
+      if (sid && sessions.has(sid)) {
+        const s = sessions.get(sid);
+        s.lastSeen = Date.now();
+        let body = '';
+        for await (const chunk of req) body += chunk;
+        let pb;
+        try { pb = JSON.parse(body); } catch { pb = undefined; }
+        patchAcceptHeader(req);
+        await s.transport.handleRequest(req, res, pb);
+        return;
+      }
+      // 带 id 但未命中（服务重启/TTL 过期）→ 404，客户端应重新 initialize
+      if (sid) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null
+        }));
+        return;
+      }
+
+      // 无 session id → 按请求类型分流（2026-09-30 修复回归）：
+      // ① initialize 请求 → 有 session 模式（openclaw 2026.9.x 需要 initialize 返回 session id）
+      // ② 其他请求 → 无状态模式（原行为：WorkBuddy/codex/claude/reasonix 等客户端每次裸调
+      //    tools/call 不带 sid，无状态 transport 跳过初始化检查直接处理。若也走有 session
+      //    模式，新建 server 未 initialize 就收 tools/call 会报 "Server not initialized"）
       let body = '';
       for await (const chunk of req) body += chunk;
       let parsedBody;
       try { parsedBody = JSON.parse(body); } catch { parsedBody = undefined; }
 
+      const isInitialize = parsedBody && parsedBody.method === 'initialize';
       const requestServer = createOpenmemServer();
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      // 响应格式尊重客户端原始 Accept：只声明 application/json 的客户端（如 openclaw 2026.9.7）
+      // 用 JSON 回（enableJsonResponse），声明了 text/event-stream 的走默认 SSE 回。
+      const rawAccept = getRawAccept(req);
+      const wantJson = rawAccept.includes('application/json') && !rawAccept.includes('text/event-stream');
+      let transport;
+      if (isInitialize) {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          enableJsonResponse: wantJson,
+          onsessioninitialized: (newSid) => {
+            sessions.set(newSid, { server: requestServer, transport, lastSeen: Date.now() });
+          },
+          onsessionclosed: (closedSid) => {
+            sessions.delete(closedSid);
+          },
+        });
+      } else {
+        // 无状态：原行为原样保留，用完即弃防句柄泄漏
+        transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+        res.on('close', () => {
+          try { transport.close(); } catch {}
+          try { requestServer.close(); } catch {}
+        });
+      }
       await requestServer.connect(transport);
 
-      // 补全 Accept header（兼容不发送 text/event-stream 的客户端，同 wiki）
+      patchAcceptHeader(req);
+      await transport.handleRequest(req, res, parsedBody);
+    });
+
+    // 读取客户端原始 Accept（patchAcceptHeader 改写 headers 前先取）
+    function getRawAccept(req) {
+      let raw = '';
+      const h = req.rawHeaders;
+      for (let i = 0; i < h.length; i += 2) {
+        if (h[i].toLowerCase() === 'accept') raw += (raw ? ',' : '') + h[i + 1];
+      }
+      return raw.toLowerCase();
+    }
+
+    // 补全 Accept header（防 SDK 对缺 text/event-stream 的请求回 406；响应格式由 enableJsonResponse 决定）
+    function patchAcceptHeader(req) {
       const origRawHeaders = req.rawHeaders;
       const hasAccept = origRawHeaders.some((h, i) => i % 2 === 0 && h.toLowerCase() === 'accept');
       const acceptVals = origRawHeaders.filter((h, i) => i % 2 === 1).join(',');
@@ -374,10 +509,10 @@ async function main() {
           }, configurable: true
         });
       }
-      await transport.handleRequest(req, res, parsedBody);
-    });
+    }
+
     httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
-      console.error(`[openmem] HTTP 模式启动: http://0.0.0.0:${HTTP_PORT}/mcp`);
+      console.error(`[openmem] HTTP 模式启动: http://0.0.0.0:${HTTP_PORT}/mcp（session 支持已启用）`);
     });
   } else {
     const transport = new StdioServerTransport();
