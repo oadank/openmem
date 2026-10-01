@@ -133,7 +133,7 @@ function createOpenmemServer() {
       } catch (e) { return T(`更新失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_search', '检索老大的统一记忆，返回**原始条目**（适合查历史细节、具体事件、某个坑的完整经过）。混合检索：向量语义 + 元数据过滤(layer/category/source/tags/时间)。⚠️ 但「老大是什么人 / 什么偏好 / 本机环境 / 服务与端口 / 某项目怎么改」这类**标准问题请先试 mh_tools_list → mh_tool**（成品答案，秒回、后台已保鲜），不要直接搜、更不要猜。注意：nssm 服务台账（agent-matrix/services）默认不返回，要查某服务的启动参数/端口用 source="agent-matrix" 显式指定。🔴 硬规矩：访问 GitHub 或任何需凭据/代理的外部 API 前，必须先在此搜访问方法（如 query="GitHub 凭据"）再动手；报限流/403 先怀疑没走通道，禁止空手重试。⚠️ 提示词库（layer=p）已与本记忆池分池，本工具**搜不到提示词**：找配方用 mh_pr_search / mh_pr_best，写入用 mh_pr_write —— 严禁把提示词用 mh_write 写回记忆池（会污染经验检索）。',
+  s.tool('mh_search', '检索老大的统一记忆，返回**原始条目**（适合查历史细节、具体事件、某个坑的完整经过）。混合检索：向量语义 + 元数据过滤(layer/category/source/tags/时间)。⚠️ 但「老大是什么人 / 什么偏好 / 本机环境 / 服务与端口 / 某项目怎么改」这类**标准问题请先试 mh_tools_list → mh_tool**（成品答案，秒回、后台已保鲜），不要直接搜、更不要猜。注意：nssm 服务台账（agent-matrix/services）默认不返回，要查某服务的启动参数/端口用 source="agent-matrix" 显式指定。🔴 硬规矩：访问 GitHub 或任何需凭据/代理的外部 API 前，必须先在此搜访问方法（如 query="GitHub 凭据"）再动手；报限流/403 先怀疑没走通道，禁止空手重试。⚠️ 提示词库（layer=p）已与本记忆池分池，本工具**搜不到提示词**：找配方/**生图取词**都用 mh_pr_search / mh_pr_best / mh_pr_random（人像场景传 kind="wildcards"），写入用 mh_pr_write —— 严禁把提示词用 mh_write 写回记忆池（会污染经验检索）。',
     {
       query: z.string().min(1).max(2000).describe('查询问题或关键词'),
       layer: z.enum(['k', 'm']).optional(),
@@ -277,10 +277,10 @@ function createOpenmemServer() {
       } catch (e) { return T(`提示词写入失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_pr_search', '【提示词库·检索】只在 prompt 库（layer=p）里搜，绝不混进经验记忆。要"H3 换脸怎么写不崩""Qwen 编辑提示词模板"这类现成配方就用它，传 kind 直达该类别。',
+  s.tool('mh_pr_search', '【提示词库·检索】只在 prompt 库（layer=p）里搜，绝不混进经验记忆。要"H3 换脸怎么写不崩""Qwen 编辑提示词模板"这类现成配方就用它，传 kind 直达该类别。🔴 生图取词主入口：传 kind="wildcards" = 按场景语义搜整段人像提示词（如"秋天树下美女""雪地黑大衣""咖啡馆窗边"），返回可直接用的完整段落——任何生图/画图任务第一步先来这里取词，禁止从零手编 prompt。',
     {
       query: z.string().min(1).max(2000).describe('要找什么提示词/场景'),
-      kind: z.string().max(40).optional().describe('限定类别，如 h3 / qwen-image；留空=搜全部提示词'),
+      kind: z.string().max(40).optional().describe('限定类别：h3 / qwen-image / wildcards（人像场景素材池，生图取词用这个）；留空=搜全部提示词'),
       tags: z.array(z.string()).default([]),
       top_k: z.number().min(1).max(50).default(10),
       requester: z.string().max(100).optional()
@@ -320,7 +320,7 @@ function createOpenmemServer() {
       catch (e) { return T(`读取失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_pr_random', '【wildcards·随机抽取】从本地 wildcards 素材库（SFW 人像/自拍整段提示词，5500+ 条）随机抽**一条完整提示词**，直接可当生图 prompt 用。与经验记忆/提示词配方库三方隔离（不进库、不进任何检索）。要定向找场景（如"雪地""咖啡馆"）用 mh_pr_search 传 kind="wildcards" 语义搜索。',
+  s.tool('mh_pr_random', '【wildcards·随机抽取】从本地 wildcards 素材库（SFW 人像/自拍整段提示词，5500+ 条）随机抽**一条完整提示词**，直接可当生图 prompt 用。🔴 任何生图/画图任务第一步必须先来这里取词（定向场景用 mh_pr_search 传 kind="wildcards"，无特定要求就本工具抽签），拿到整段再按需加工，禁止从零手编 prompt。与经验记忆/提示词配方库三方隔离（不进库、不进任何检索）。',
     {
       file: z.string().max(100).optional().describe('词库文件名（_local/wildcards/ 下，如 sfw_portrait_v3），不给则随机选一个')
     },
