@@ -129,7 +129,7 @@ mh_write(content="…结论/坑…", source="<agent名>", layer="m",
 
 ## Web 控制台
 
-默认 `http://127.0.0.1:3467`（**无鉴权**，勿对公网裸奔）。
+默认 `https://127.0.0.1:3467`（**无鉴权**，勿对公网裸奔；2026-10-22 起单栈 https，证书 `C:\D\opt\certs\localhost\`，缺证书自动回落 http；curl 测试加 `--ssl-no-revoke`）。
 
 | 页签 | 能力 |
 |---|---|

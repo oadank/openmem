@@ -702,10 +702,21 @@ def gov_merge_contents(primary, extras):
 
 
 def gov_scan_aggressive(threshold_large=0.92, threshold_small=0.88, small_len=500):
-    """扫库：真快照 + 语义簇 + 小条合并组。只读。"""
+    """扫库：真快照 + 语义簇 + 小条合并组。只读。
+
+    🔴 layer='p'（提示词库 wildcards 素材池，5501 条）整体豁免：
+    2026-10-19 实测（dsh）——不豁免时 625 组"待合并"里绝大多数是两条
+    *不同画面*的提示词素材（"棒球场看台少女" vs "咖啡馆少女" sim=0.97），
+    它们被撮合纯粹因为同为"年轻女性+长段落人像描述"，embedding 相似度高，
+    而治理判据（旧版/子集/同一事实换说法）套不到素材条目上——素材没有
+    "新旧版"概念，只有"不同场景"。按 ✅ 放行 = 5501 条素材互相吞并，
+    mh_pr_random / mh_pr_search 直接残废。同款教训见记忆 1bf687c8
+    （"同源快照按 category 整组归档是误伤，0 条执行"）。
+    """
     import numpy as np
     rows = db_query("""SELECT id, layer, category, source, content, embedding, pinned, created_at
-                       FROM memory_entries WHERE superseded_by IS NULL ORDER BY created_at DESC""")
+                       FROM memory_entries WHERE superseded_by IS NULL AND layer <> 'p'
+                       ORDER BY created_at DESC""")
     if not rows:
         return {"clusters": [], "merges": [], "snapshots": [], "stale": [], "total": 0}
     meta = []
@@ -737,7 +748,7 @@ def gov_scan_aggressive(threshold_large=0.92, threshold_small=0.88, small_len=50
     emap = {}
     if normal:
         ph = ",".join(["%s"] * len(normal))
-        erows = db_query(f"SELECT id, embedding FROM memory_entries WHERE id IN ({ph}) AND superseded_by IS NULL",
+        erows = db_query(f"SELECT id, embedding FROM memory_entries WHERE id IN ({ph}) AND superseded_by IS NULL AND layer <> 'p'",
                          tuple(m["id"] for m in normal))
         for rid, emb in erows:
             try:
@@ -1778,6 +1789,18 @@ def _am_sync_loop():
             print(f"[openmem-web] agent-matrix 同步失败: {e}", flush=True)
 
 
+def _load_tls():
+    """有证书就走 https（单栈，与 config-center :13600 同套路）；缺证书回落 http。"""
+    cert = os.environ.get("OPENMEM_WEB_TLS_CERT", r"C:\D\opt\certs\localhost\cert.pem")
+    key = os.environ.get("OPENMEM_WEB_TLS_KEY", r"C:\D\opt\certs\localhost\key.pem")
+    if cert and key and os.path.isfile(cert) and os.path.isfile(key):
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        return ctx
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=PORT)
@@ -1785,7 +1808,12 @@ def main():
     import threading
     threading.Thread(target=_am_sync_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
-    print(f"[openmem-web] listening on 0.0.0.0:{args.port}", flush=True)
+    tls = _load_tls()
+    if tls:
+        srv.socket = tls.wrap_socket(srv.socket, server_side=True)
+        print(f"[openmem-web] listening on https://0.0.0.0:{args.port}", flush=True)
+    else:
+        print(f"[openmem-web] listening on http://0.0.0.0:{args.port} (no tls cert)", flush=True)
     srv.serve_forever()
 
 if __name__ == "__main__":
