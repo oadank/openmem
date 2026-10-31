@@ -55,3 +55,4 @@ _gate_state.json.tmp
 # 本地数据与备份，绝不入库（本仓库 public）：记忆全量导出 + 改前 .bak
 _local/
 *.bak-*
+_backup_*.sql
