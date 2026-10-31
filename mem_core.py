@@ -5,7 +5,7 @@ openmem 记忆中枢 Python 内核
 存储: PostgreSQL(openmem库) embedding: 本机BGE:11435  LLM: litellm GwV4F :4000
 所有子命令输出 UTF-8 JSON 到 stdout，错误输出到 stderr 并 exit 1
 """
-import sys, os, json, re, time, hashlib, argparse
+import sys, os, json, re, time, hashlib, argparse, glob
 from datetime import datetime, timezone
 
 sys.stdout.reconfigure(encoding='utf-8')
@@ -134,6 +134,10 @@ def resolve_entry_id(cur, raw):
     与 web_server._resolve_entry_id 同口径，MCP 侧（mh_get/mh_update）不再弹 -32602。"""
     rid = (raw or '').strip().lower()
     if _UUID_RE.match(rid):
+        # 🔴 完整 uuid 也要确认库里真有此条：否则后续 fetchone()[0] 会对 None 下标 → 'NoneType' object is not subscriptable
+        cur.execute("SELECT 1 FROM memory_entries WHERE id=%s::uuid", (rid,))
+        if not cur.fetchone():
+            return None, 'id 查无此条（完整 uuid 无命中）: %s' % raw
         return rid, None
     if not re.match(r'^[0-9a-f]{6,32}$', rid):
         return None, 'id 格式不对：传完整 36 位 uuid，或其开头 ≥6 位十六进制短 id: %s' % raw
@@ -391,7 +395,8 @@ def gate_rules_text():
     except Exception as e:
         return ("# openmem 写入规矩（RULES.md 读取失败：%s）\n\n"
                 "① 先搜（mh_search，带 requester）→ ② 有则 mh_update → ③ 无则 mh_write → "
-                "④ 同主题只维护一条活条目。错的直接删，不搞归档。" % e)
+                "④ 同主题只维护一条活条目。写错：能改就 update；同一件事软取代（supersede）；"
+                "老大点名才 hard 删。" % e)
 
 # 规矩正文外置到 RULES.md（由 gate_rules_text() 读取）—— 2026-09-18 老大纠正：
 # 闸门要的是"领规矩"这个动作，不是把一份胖手册塞回上下文。
@@ -399,13 +404,71 @@ def gate_rules_text():
 
 
 def gate_skill_text(detail="", topic=""):
-    """mh_skill 的正文 —— **只有规矩一种**，没有"完整手册"这回事了。
+    """mh_skill 的正文 —— 真源只有 RULES.md 一种，detail 参数保留兼容老调用方、忽略。
 
-    2026-09-18 老大拍板：MANUAL.md 太大（11491 字符 / 7117 token）**已删**；
-    原则是「能塞进技能文件的塞进去，塞不进的一律不留」。
-    detail / topic 参数保留**纯粹为兼容老调用方，一律忽略**。
+    2026-10-31 老大批准 B+C：RULES.md 压缩为 6 节准入条文；topic= 按节分发省 token。
+      · topic 为空 → 全文（~3.2k 字符兜底）
+      · topic 命中节 → 该节 + **坑表恒附、（读节以外的）铁律恒附**
+      · topic 不中 → 回落全文，绝不给空
+    设计取舍与理由全文在条目 9503b404，不在本函数展开。
     """
-    return gate_rules_text()
+    full = gate_rules_text()
+    t = (topic or "").strip()
+    if not t:
+        return full
+    secs = _gate_skill_sections(full)
+    if not secs:
+        return full
+    key = GATE_TOPIC_ALIAS.get(t.lower(), "")
+    hit = None
+    for title, body in secs:
+        if (key and title == key) or (not key and t in title):
+            hit = (title, body)
+            break
+    if hit is None:
+        return full
+    parts = [f"## {hit[0]}\n{hit[1]}"]
+    picked = {hit[0]}
+    # 恒附：坑表永远带；铁律三条（凭据 / 正文 / embedding_v）全是写侧规矩，
+    # 读节不带 —— 读侧省 ~200 字符且不误导。
+    attach = ("坑表",) if hit[0] == "读" else ("坑表", "铁律")
+    for want in attach:
+        if want not in picked:
+            for title, body in secs:
+                if title == want:
+                    parts.append(f"## {want}\n{body}")
+                    picked.add(want)
+    tail = "坑表" if attach == ("坑表",) else "坑表 + 铁律"
+    head = (f"【mh_skill topic={t} 按节分发】本节规矩 + {tail}（恒附）。"
+            "不带 topic 调本工具 = 全文；设计取舍见条目 9503b404。\n\n")
+    return head + "\n\n".join(parts)
+
+
+# topic= 别名表：agent 可能写英文 / 关键词，归一到 RULES.md 的节标题
+GATE_TOPIC_ALIAS = {
+    "读": "读", "read": "读", "检索": "读", "search": "读",
+    "写": "写", "write": "写", "闸门": "写", "规矩": "写", "领票": "写",
+    "技能": "技能", "skill": "技能", "注册": "技能", "register": "技能",
+    "代码": "代码", "code": "代码", "路标": "代码",
+    "坑": "坑表", "坑表": "坑表", "pitfalls": "坑表",
+    "铁律": "坑表", "iron": "坑表",   # 铁律随坑表一起回，不单列（两节互相恒附，单列等于重复项）
+}
+
+
+def _gate_skill_sections(text):
+    """RULES.md 按 '## ' 标题拆节 → [(标题, 正文)]；读不到节（fallback 文本）返回 None。"""
+    lines = text.splitlines()
+    secs, cur_title, cur = [], None, []
+    for ln in lines:
+        if ln.startswith("## "):
+            if cur_title is not None:
+                secs.append((cur_title, "\n".join(cur).strip()))
+            cur_title, cur = ln[3:].strip(), []
+        elif cur_title is not None:
+            cur.append(ln)
+    if cur_title is not None:
+        secs.append((cur_title, "\n".join(cur).strip()))
+    return secs or None
 
 
 def _gate_agent_get(agent):
@@ -489,7 +552,7 @@ def gate_mark_handbook(tool_name, agent=""):
     return gate_mark_skill(agent)
 
 
-def gate_check_write(source):
+def gate_check_write(source, category=None):
     """闸门 ①②：返回 None=放行；返回 dict=拦下（已可直接 out()）
 
     🔴 两道闸门都按 source（=「你自己」）记账，不看别人（2026-09-18 老大纠正）。
@@ -512,7 +575,7 @@ def gate_check_write(source):
         _gate_sql("""INSERT INTO gate_state (agent, skill_denied, skill_denied_at) VALUES (%s,1,%s)
                      ON CONFLICT (agent) DO UPDATE SET skill_denied=gate_state.skill_denied+1,
                        skill_denied_at=EXCLUDED.skill_denied_at, updated_at=now()""", (rq, now))
-        return {
+        d = {
             "ok": False, "gate": "rules", "denied": True,
             "reason": "写入被拦（第 1 关 / 共 3 关）：你（%s）手上没有规矩票。" % source,
             "how_to_pass": '调用 mh_skill(agent="%s") —— 它就在你的工具清单里、无需别的参数，'
@@ -521,7 +584,13 @@ def gate_check_write(source):
             "note": "票制：领一次管一条（openmem 是无状态服务，做不出「每会话一次」）。"
                     "规矩是每个 agent 各自的义务 —— 别人领过，不代表你可以跳过。",
         }
-
+        # 🔴 手写技能条目 = 危险动作（最常犯的错是把 SKILL.md 全文灌进 uskill_*）：
+        #    拦下的当场把设计初衷拍给它看，别让它领完票再犯一次（2026-10-30 老大拍板）。
+        if category in USKILL_CATS:
+            d["arch_hint"] = SKILL_ARCH_HINT
+            d["arch_hint_why"] = ("你正手写 openmem 的技能层。正确姿势是走 mh_register_skill 自动生成"
+                                  "（名片 + 摘要 + 真源路径），不要手写 uskill_* 条目，更不要灌 SKILL.md 全文。")
+        return d
     # ② 查重闸门：你自己 30min 内没搜过库 → 拦。**无豁免，超窗就拦。**
     if (now - searched_at) > GATE_SEARCH_MIN * 60:
         _gate_sql("""INSERT INTO gate_state (agent, search_denied, search_denied_at) VALUES (%s,1,%s)
@@ -579,6 +648,13 @@ def gate_check_dup(cur, source, emb_vec, content, category=None):
     🔴 内含**防死锁安全阀**（09-18 补进文档）：同一版内容被拦过一次后、再交一次即放行 ——
     防「确实该写却永远过不去」把 agent 卡死。安全阀是防卡死，不是给闸门开口子。
     """
+    # 🔴 技能搬运类（uskill_doc / uskill_idx）不做语义判重（2026-10-30 老大拍板）
+    #   理由：① 技能入库是「整份复制文件」，不是记笔记，相似不该拦；
+    #        ② BGE 只算前 512 token，同族技能的同名文件（continuity.md / output-contract.md）
+    #           会被判 0.86-0.99 误拦，只能靠安全阀硬过 —— 安全阀不该是常规路径；
+    #        ③ 真正的重复仍由 content_hash 精确去重挡住（_batch_insert 的 ON CONFLICT）。
+    if category in USKILL_CATS:
+        return None
     try:
         near = _gate_neighbours(cur, emb_vec, GATE_DUP_SHOW)
     except Exception:
@@ -702,6 +778,22 @@ def cmd_deprecate(a):
         left = cur.fetchone()[0]
         cur.close(); conn.close()
         out({"ok": True, "restored": rid, "still_deprecated": left}); return
+    if getattr(a, "hard", False):
+        cur.execute("SELECT left(split_part(content, chr(10), 1), 70), length(content) FROM memory_entries WHERE id=%s::uuid", (rid,))
+        old = cur.fetchone()
+        if not old:
+            cur.close(); conn.close(); out({"ok": False, "error": "id 查无此条（已解析但库里无此条）: " + rid}); return
+        # 清悬链：若有其它条目退休引用指向本 id，置回 NULL 防悬空
+        cur.execute("UPDATE memory_entries SET superseded_by=NULL WHERE superseded_by=%s::uuid", (rid,))
+        cleared = cur.rowcount
+        cur.execute("DELETE FROM memory_entries WHERE id=%s::uuid", (rid,))
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close(); conn.close()
+        out({"ok": True, "hard_deleted": rid, "deleted_head": old[0], "deleted_len": old[1],
+             "cleared_dangling_refs": cleared,
+             "warning": "🔴 物理删除，不可恢复——误删只能从 _backup_*.sql 恢复"})
+        return
     if not a.supersede:
         cur.close(); conn.close()
         out({"ok": False, "error": "必须给 --supersede <保留条id>；本命令只做『合并后下线』，不做无痕删除"}); return
@@ -712,8 +804,12 @@ def cmd_deprecate(a):
         cur.close(); conn.close(); out({"ok": False, "error": "不能自己指向自己"}); return
     cur.execute("SELECT left(split_part(content, chr(10), 1), 70), length(content) FROM memory_entries WHERE id=%s::uuid", (rid,))
     old = cur.fetchone()
+    if not old:
+        cur.close(); conn.close(); out({"ok": False, "error": "id 查无此条（已解析但库里无此条）: " + rid}); return
     cur.execute("SELECT left(split_part(content, chr(10), 1), 70), length(content) FROM memory_entries WHERE id=%s::uuid", (tid,))
     new = cur.fetchone()
+    if not new:
+        cur.close(); conn.close(); out({"ok": False, "error": "保留条查无此条: " + tid}); return
     cur.execute("UPDATE memory_entries SET superseded_by=%s::uuid, updated_at=now() WHERE id=%s::uuid", (tid, rid))
     conn.commit()
     cur.execute("SELECT count(*) FROM memory_entries WHERE superseded_by IS NOT NULL")
@@ -727,12 +823,25 @@ def cmd_deprecate(a):
 # ── 写入 / 检索 ───────────────────────────────────────────
 
 def cmd_write(a):
+    # 🔴 技能层（uskill_idx / uskill_doc）**禁止手写**（2026-10-30 黑盒验收当场抓到）：
+    #    之前只是在第①关拦截语里"劝"它别手写 —— 可领完票、搜完库，照样能写进去，
+    #    等于提示不是关卡。技能层的唯一合法来源是 mh_register_skill 自动生成
+    #    （名片 + 摘要 + 真源路径）；要改已有条目走 mh_update，要新增技能走 register。
+    if a.category in USKILL_CATS:
+        out({"ok": False, "denied": True, "gate": "skill_layer",
+             "reason": "技能层（category=%s）不接手工写入 —— 这一层由 mh_register_skill 自动生成，"
+                       "手写会造成「库里旧、文件新」两套版本（条目 9503b404）。" % a.category,
+             "how_to_pass": '新增技能：mh_register_skill(file=["<SKILL.md 绝对路径>"], agent="<你的名>")；'
+                            '改已有名片/摘要：mh_update(id=..., content=...)；'
+                            '写普通记忆：category 换成 misc / projects / lessons 之类再写。',
+             "arch_hint": SKILL_ARCH_HINT})
+        return
     a.content, _cred_hits = sanitize_credentials(a.content)
     emb_vec = emb([a.content])[0]
     conn = connect(); cur = conn.cursor()
 
     # ── 写入闸门 ①②：规矩 + 查重（2026-09-18）────────────
-    gate = gate_check_write(a.source)
+    gate = gate_check_write(a.source, a.category)
     if gate:
         cur.close(); conn.close(); out(gate); return
     # ── 写入闸门 ③：与库里已有条目高度雷同 → 逼它去 update
@@ -743,15 +852,15 @@ def cmd_write(a):
     ch = content_hash(a.content)
     cur.execute("""
         INSERT INTO memory_entries (layer, category, source, content, embedding, embedding_v, tags,
-                                    confidence, pinned, content_hash)
-        VALUES (%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,%s)
+                                    confidence, pinned, content_hash, media_type, content_class)
+        VALUES (%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (source, content_hash) DO UPDATE
           SET content=EXCLUDED.content, embedding=EXCLUDED.embedding,
               embedding_v=EXCLUDED.embedding_v, tags=EXCLUDED.tags,
               updated_at=now(), last_verified_at=now()
         RETURNING id, (xmax = 0) AS inserted
     """, (a.layer, a.category, a.source, clean_nul(a.content), to_pg_array(emb_vec),
-          vec_literal(emb_vec), a.tags, a.confidence, a.pinned, ch))
+          vec_literal(emb_vec), a.tags, a.confidence, a.pinned, ch, a.media_type, a.content_class))
     row = cur.fetchone()
     # 写后回显：把库里最像的几条拍给它看（正面引导去重，不拦人）
     similar = []
@@ -859,6 +968,9 @@ def cmd_update(a):
         out({"ok": False, "error": "更新失败（可能与已有条目 (source, content_hash) 重复）: %s" % e})
         return
     row = cur.fetchone()
+    if not row:
+        conn.rollback(); cur.close(); conn.close()
+        out({"ok": False, "error": "id 查无此条（更新 0 行）: " + rid}); return
     conn.commit(); cur.close(); conn.close()
     out({"ok": True, "id": str(row[0]), "updated": True, "cred_masked": _cred_hits})
 
@@ -871,7 +983,7 @@ def _filters(a):
     """按 search 参数拼 WHERE 片段与参数（不含向量条件）"""
     sql = "superseded_by IS NULL" if not getattr(a, "include_archived", False) else "TRUE"
     params = []
-    for col in ("layer", "category", "source"):
+    for col in ("layer", "category", "source", "media_type", "content_class"):
         v = getattr(a, col, None)
         if v:
             sql += " AND %s=%%s" % col
@@ -916,6 +1028,18 @@ def _keyword_top(cur, query, where, params, limit):
 _SYM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-:/\\]{2,}")
 _SYM_STOP = {"the", "and", "for", "with", "this", "that", "true", "false", "null", "none", "def", "var"}
 
+# [2026-10-30 修] 中文补路：_SYM_RE 只认 ASCII 开头，纯中文 query 一个词元都抽不出来
+# → _symbol_top 整路返回空 → RRF 只剩向量单路，top1 恒为 1/(k+1)=0.04762，
+# 被 skill_gate_hook 的 MIN_SCORE=0.05 结构性全过滤（技能名片永远弹不出来）。
+# 补中文 2-gram 当符号词元，让中文 query 也有第二路印证。英文 query 无中文，不受影响。
+_ZH_RE = re.compile(r"[\u4e00-\u9fa5]{2,}")
+_ZH_STOP = {
+    "什么", "怎么", "如何", "我们", "你们", "他们", "这个", "那个", "可以", "需要",
+    "一下", "现在", "然后", "因为", "所以", "但是", "就是", "还是", "没有", "不是",
+    "一个", "这样", "那样", "这些", "那些", "为什", "么样", "么弄", "有没", "有什",
+    "帮我", "给我", "你能", "能不", "不能", "是不", "不要", "要是", "如果", "或者",
+}
+
 
 def _like_escape(s):
     """LIKE 模式转义（PG 默认转义符是反斜杠，且 _ 与 % 是通配符）"""
@@ -936,6 +1060,28 @@ def _sym_tokens(query, maxn=8):
         out.append(t)
         if len(out) >= maxn:
             break
+    return out
+
+
+def _zh_bigrams(query, maxn=20):
+    """中文 2-gram（只用于「字面印证」判定，不进 RRF 排序）
+
+    [2026-10-30] 纯中文 query 抽不出符号词元 → 符号路整路空 → RRF 只剩向量单路，
+    top1 恒为 1/(k+1)=0.04762，低于 skill_gate_hook 的 MIN_SCORE=0.05 被结构性全过滤。
+    试过把 2-gram 塞进 _sym_tokens 参与排序，结果泛词（照片/编辑）把无关条目顶到第一，
+    真正相关的 qw-image-prompt-engine 反被挤出前三 —— 所以 2-gram 只能当「有没有字面重合」
+    的印证信号，绝不参与打分。
+    """
+    out, seen = [], set()
+    for seg in _ZH_RE.findall(query or ""):
+        for i in range(len(seg) - 1):
+            bg = seg[i:i + 2]
+            if bg in _ZH_STOP or bg in seen:
+                continue
+            seen.add(bg)
+            out.append(bg)
+            if len(out) >= maxn:
+                return out
     return out
 
 
@@ -1040,6 +1186,7 @@ def cmd_search(a):
     pool = max(60, min(400, a.candidates // 40)) if getattr(a, "candidates", None) else 80
     fused = _hybrid_ids(cur, a.query, q_vec, where, params, a.top_k, pool=pool)
     ids = [mid for mid, _ in fused]
+    zh = _zh_bigrams(a.query)  # 中文字面印证用（不参与排序，只打标）
     scored = []
     if ids:
         ph = ",".join(["%s"] * len(ids))
@@ -1050,9 +1197,11 @@ def cmd_search(a):
             r = by_id.get(mid)
             if not r:
                 continue
+            zh_hit = sum(1 for t in zh if t in (r[4] or "")) if zh else 0
             scored.append({"id": str(r[0]), "layer": r[1], "category": r[2], "source": r[3],
                            "content": r[4][:1500], "tags": r[5], "pinned": r[6],
-                           "created_at": r[7].isoformat(), "score": round(float(sc), 5)})
+                           "created_at": r[7].isoformat(), "score": round(float(sc), 5),
+                           "zh_hit": zh_hit})
     # —— 检索留痕（2026-09-15）：只记查询与命中 id，供治理用；失败绝不影响检索 ----------
     try:
         conn2 = connect(); cur2 = conn2.cursor()
@@ -1301,20 +1450,77 @@ def cmd_tools_list(a):
 
 # ── 批量导入 / 状态 ──────────────────────────────────────
 
-def cmd_import_batch(a):
-    with open(a.file, encoding="utf-8") as f:
-        items = json.load(f)
+# ── 技能入库（openmem 原生能力，2026-10-29 收编 skill_register.py）────────
+USKILL_DOC = "uskill_doc"   # 详情层：≤1200 字摘要（讲什么/章节大纲/真源路径）——2026-10-30 起不存全文
+USKILL_IDX = "uskill_idx"   # 名片层：技能名+何时用(≤300字)+正文路径（检索唯一入口）
+USKILL_CATS = {USKILL_DOC, USKILL_IDX}   # 技能搬运类：跳过语义判重（见 gate_check_dup）
+CARD_MAX = 300             # 名片硬上限，超了告警，保证注入不膨胀
+DOC_MAX = 1200             # 详情层硬上限（字符）：留余量，正文永远读文件
+# 🔴 设计初衷（条目 9503b404，改这段前先读）：技能正文只在文件里，openmem 只做索引 + 路径。
+#    判据：这内容改了之后会不会出现「库里旧、文件新」两个版本？会 → 不入库。
+#
+# 🔴 技能入库闸门提示（2026-10-30 老大拍板）：
+#    设计初衷只写进 RULES.md 是「被动可查」—— 换新对话的 agent 不去读就等于没写。
+#    所以把它挂在「写技能」这条必经路径上：register_skill 每次返回体都带，mh_write 手写
+#    uskill_* 被第 1 关拦下时内联。**正确动作（register）不拦只提示；危险动作（手写灌库）拦下并给判据。**
+SKILL_ARCH_HINT = (
+    "【技能入库·三条（改架构前必读条目 9503b404）】\n"
+    "① 正文永远在文件里：openmem 只存名片 + ≤1200字摘要 + 真源绝对路径，正文靠 read 文件现取。\n"
+    "② 判据：这内容改了之后会不会出现「库里旧、文件新」两个版本？会 → 只写路径，绝不灌全文。\n"
+    "③ 用法：mh_register_skill(file=[SKILL.md 绝对路径], agent=\"你的名\")，同名重复按 content_hash 自动跳过。"
+)
+
+
+def _skill_digest(name, desc, text, path):
+    """技能详情层摘要（≤DOC_MAX）：讲什么 + 章节大纲 + 真源路径。
+    🔴 2026-10-30 改：以前这里存 SKILL.md 全文，导致「库里旧、文件新」双份过期。
+       设计初衷见条目 9503b404 —— 正文永远 read 文件，这里只做路标。"""
+    heads, fence = [], False
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if s.startswith("```"):
+            fence = not fence
+            continue
+        if not fence and re.match(r"^#{1,2}\s+\S", s):
+            heads.append(s.lstrip("# ").strip())
+    heads = heads[:14]
+    body = ("【技能】%s\n【讲什么】%s\n【章节】%s\n【真源】%s\n"
+            "【注意】正文现读上面路径的文件，本摘要只是路标（%d 字符原件不入库）"
+            % (name, desc[:300], " / ".join(heads) or "（无标题）",
+               path, len(text)))
+    return body[:DOC_MAX]
+
+
+def _parse_skill_front(text):
+    name = desc = ""
+    m = re.match(r"^---\s*\n(.*?)\n---", text, re.S)
+    if m:
+        for ln in m.group(1).splitlines():
+            if ln.startswith("name:"):
+                name = ln.split(":", 1)[1].strip()
+            elif ln.startswith("description:"):
+                desc = ln.split(":", 1)[1].strip()
+    return name, desc
+
+
+def _skill_triggers(desc):
+    m = re.search(r"触发词[:：](.+)", desc)
+    if not m:
+        return []
+    return [t.strip() for t in re.split(r"[、,，/]", m.group(1)) if t.strip()][:12]
+
+
+def _batch_insert(items):
+    """批量入库核心：凭据打码 → 拒收 insights → 增量去重 → 批 embed+插入。
+    返回统计。import_batch 与 register_skill 共用，避免逻辑漂移。"""
     total = len(items)
-    # 闸 0：凭据打码——任何来源的内容进库前先遮凭据值（2026-09-12）
     masked_n = 0
     for x in items:
         if isinstance(x.get("content"), str):
             x["content"], n = sanitize_credentials(x["content"])
             masked_n += 1 if n else 0
-    # 闸 1：拒收 agentmemory-insights（抽象方法论，会污染检索；与 server.js mh_write 策略一致）
     items = [x for x in items if (x.get("source") or "").strip().lower() != "agentmemory-insights"]
     rejected = total - len(items)
-    # 闸 2：增量——已存在的 (source, content_hash) 直接跳过，不再白算 embedding
     conn0 = connect(); cur0 = conn0.cursor()
     cur0.execute("SELECT source, content_hash FROM memory_entries")
     existing = set(cur0.fetchall())
@@ -1336,22 +1542,135 @@ def cmd_import_batch(a):
                 # 双写 embedding_v（vector 列，HNSW 检索用）——2026-09-12 修复漏写 bug
                 cur.execute("""
                     INSERT INTO memory_entries (layer, category, source, content, embedding, embedding_v, tags,
-                                                confidence, pinned, content_hash, created_at)
-                    VALUES (%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,%s, COALESCE(%s, now()))
+                                                confidence, pinned, content_hash, created_at, media_type, content_class)
+                    VALUES (%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,%s, COALESCE(%s, now()), %s, %s)
                     ON CONFLICT (source, content_hash) DO NOTHING
                 """, (x.get("layer", "k"), x.get("category", "misc"), x.get("source", "unknown"),
                       clean_nul(x["content"]), to_pg_array(vec), vec_literal(vec), x.get("tags", []),
                       x.get("confidence", 0.5), x.get("pinned", False), content_hash(x["content"]),
-                      x.get("created_at")))
+                      x.get("created_at"), x.get("media_type"), x.get("content_class")))
                 if cur.rowcount: inserted += 1
                 else: dup += 1
             except Exception as e:
                 print(f"[insert fail] {x.get('source')}: {e}", file=sys.stderr); failed += 1
         conn.commit(); cur.close(); conn.close()
         print(f"[进度] {min(i+B,total)}/{total}", file=sys.stderr)
-    out({"ok": True, "total": total, "inserted": inserted, "duplicate": dup,
-         "skipped_existing": skipped, "rejected_insights": rejected, "failed": failed,
-         "cred_masked_entries": masked_n})
+    return {"inserted": inserted, "duplicate": dup, "failed": failed,
+            "skipped_existing": skipped, "rejected_insights": rejected,
+            "cred_masked_entries": masked_n}
+
+
+def cmd_import_batch(a):
+    with open(a.file, encoding="utf-8") as f:
+        items = json.load(f)
+    r = _batch_insert(items)
+    r["ok"] = True; r["total"] = len(items)
+    out(r)
+
+
+def cmd_register_skill(a):
+    """openmem 原生技能入库（替代外挂 skill_register.py）：把一个/多个 SKILL.md
+    拆成「名片层 uskill_idx + 详情层 uskill_doc」两条记忆。
+      · 名片层 = 技能名 + 何时用(≤300字) + 【正文】真源绝对路径（检索唯一入口）
+      · 详情层 = ≤1200 字摘要（讲什么 / 章节大纲 / 真源路径）—— **绝不存 SKILL.md 全文**
+      · 正文永远读文件；BGE 只算前 512 token，存全文等于后半截永远搜不到（条目 9503b404）
+    用法:
+      mem_core.py register_skill --file <SKILL.md> [--file <SKILL.md> ...] [--agent <名>]
+      mem_core.py register_skill --all        # 扫 ~/.workbuddy/skills/*/SKILL.md（会连协议类一起迁，慎用）
+    这是 openmem 自己的能力——不再是编外脚本。重复注册同名会因 content_hash 去重自动跳过。"""
+    agent = (getattr(a, "agent", "") or "").strip() or "openmem"
+    try:
+        gate_mark_skill(agent)   # 写入闸门第①关领票
+    except Exception:
+        pass
+    paths = list(getattr(a, "file", None) or [])
+    if getattr(a, "all", False):
+        paths = sorted(glob.glob(os.path.expanduser("~/.workbuddy/skills/*/SKILL.md")))
+    if not paths:
+        out({"ok": False, "error": "未给 --file 也没开 --all"})
+        return
+    now = datetime.now().isoformat()
+    docs, cards, metas = [], [], []
+    for p in paths:
+        if not os.path.isfile(p):
+            print("  跳过(不存在):", p, file=sys.stderr); continue
+        text = open(p, encoding="utf-8").read()
+        name, desc = _parse_skill_front(text)
+        if not name:
+            name = os.path.splitext(os.path.basename(p))[0]
+        brief = desc[:150]
+        card = (f"【技能】{name}\n【何时用】{brief}\n"
+                f"【正文】{p}")
+        metas.append({"slug": name, "card": card, "tags": _skill_triggers(desc)})
+        docs.append({"content": _skill_digest(name, desc, text, p), "layer": "k", "category": USKILL_DOC,
+                     "source": name, "tags": ["技能摘要", name],
+                     "confidence": 0.95, "created_at": now,
+                     "media_type": "", "content_class": ""})
+    if not metas:
+        out({"ok": False, "error": "无有效 SKILL.md"})
+        return
+    ins_doc = _batch_insert(docs)
+    # 回填详情 id（供名片指向懒加载）+ **清掉同技能的旧摘要**
+    #   🔴 2026-10-30 补漏（实测踩到）：技能文件一改 → 摘要内容变 → content_hash 不同 → 会插新条，
+    #     旧摘要留在库里继续被检索到 = 旧大纲（含已删章节）当道，正是「库里旧、文件新」的毒药。
+    #     摘要/名片是自动派生数据、没人按 id 引用它（引用的是真源路径），删了可随时重建 → 物理删，
+    #     不搞 supersede 归档（老大规矩：旧版本不堆流水账）。
+    conn = connect(); cur = conn.cursor()
+    for m in metas:
+        cur.execute("SELECT id FROM memory_entries WHERE category=%s AND source=%s AND superseded_by IS NULL ORDER BY created_at DESC LIMIT 1",
+                    (USKILL_DOC, m["slug"]))
+        row = cur.fetchone()
+        m["docid"] = (row[0] if row else "")[:8]
+        m["old_doc_removed"] = 0
+        if row:
+            # 只清「自动生成的摘要」（带【真源】标记），别误删同 source 的其它条目
+            # —— 2026-10-30 黑盒验收抓到：原来按 source 全删，会把同名手写条目一起清掉。
+            cur.execute("""DELETE FROM memory_entries WHERE category=%s AND source=%s AND id <> %s
+                           AND content LIKE '【技能】%%' AND content LIKE '%%【真源】%%'""",
+                        (USKILL_DOC, m["slug"], row[0]))
+            m["old_doc_removed"] = cur.rowcount
+    conn.commit(); cur.close(); conn.close()
+    for m in metas:
+        c = m["card"].replace("{DOCID}", m["docid"])
+        if len(c) > CARD_MAX:
+            print(f"  ⚠ 名片超长 {len(c)} {m['slug']}", file=sys.stderr)
+        cards.append({"content": c, "layer": "k", "category": USKILL_IDX,
+                      "source": "uskill_idx", "tags": ["技能名片", m["slug"]] + m["tags"],
+                      "confidence": 0.95, "created_at": now,
+                      "media_type": "", "content_class": ""})
+    ins_card = _batch_insert(cards)
+    # 名片同理：brief / 触发词变了会插新卡，旧卡留在库里会命中过期触发词 → 只留最新一张
+    #  🔴 2026-10-31 修：原来用 `tags @> ARRAY[slug]` 定位同技能名片，但**早期版本生成的名片
+    #     tags 里没有 slug**（只有「技能名片」+ 触发词）→ 匹配不到 → 旧卡删不掉，
+    #     重注册后同一技能留两张卡，检索命中过期触发词（img-storyboard-fight 实测踩到）。
+    #     改用内容首行 `【技能】<slug>` + 换行 精确定位，不依赖 tags。
+    conn = connect(); cur = conn.cursor()
+    for m in metas:
+        like = "【技能】" + m["slug"] + "\n%"
+        cur.execute("""SELECT id FROM memory_entries WHERE category=%s AND content LIKE %s
+                       AND superseded_by IS NULL ORDER BY created_at DESC LIMIT 1""",
+                    (USKILL_IDX, like))
+        row = cur.fetchone()
+        m["old_card_removed"] = 0
+        if row:
+            # 同 doc：只清自动生成的名片（带【正文】标记），别误删别的
+            cur.execute("""DELETE FROM memory_entries WHERE category=%s AND content LIKE %s
+                           AND id <> %s AND content LIKE '%%【正文】%%'""",
+                        (USKILL_IDX, like, row[0]))
+            m["old_card_removed"] = cur.rowcount
+    conn.commit(); cur.close(); conn.close()
+    try:
+        gate_consume_skill_ticket(agent)
+    except Exception:
+        pass
+    out({"ok": True,
+         "skills": [{"slug": m["slug"], "doc_id": m["docid"], "card_len": len(m["card"]),
+                     "old_doc_removed": m.get("old_doc_removed", 0),
+                     "old_card_removed": m.get("old_card_removed", 0)} for m in metas],
+         "doc": {"inserted": ins_doc.get("inserted"), "duplicate": ins_doc.get("duplicate"), "failed": ins_doc.get("failed")},
+         "card": {"inserted": ins_card.get("inserted"), "duplicate": ins_card.get("duplicate"), "failed": ins_card.get("failed")},
+         # 🔴 每次入库都把架构判据拍给它，防「换新对话就忘」（2026-10-30 老大拍板）
+         "arch_hint": SKILL_ARCH_HINT})
 
 def cmd_gate(a):
     """写入闸门状态查看 / 重置（状态在 PG：表 gate_state / gate_meta）"""
@@ -1431,6 +1750,8 @@ def main():
     w.add_argument("--source", required=True)
     w.add_argument("--layer", default="k", choices=["k", "m", "p"])
     w.add_argument("--category", default="misc")
+    w.add_argument("--media_type", default=None, help="产出类型: img 图片 / vid 视频 / mus 音乐")
+    w.add_argument("--content_class", default=None, help="内容大类: scene 场景 / char 人物 / animal 动物 / object 器物")
     w.add_argument("--tags", default="", help="逗号分隔")
     w.add_argument("--confidence", type=float, default=0.5)
     w.add_argument("--pinned", action="store_true")
@@ -1449,7 +1770,7 @@ def main():
 
     s = sub.add_parser("search")
     s.add_argument("--query", required=True)
-    s.add_argument("--layer"); s.add_argument("--category"); s.add_argument("--source")
+    s.add_argument("--layer"); s.add_argument("--category"); s.add_argument("--source"); s.add_argument("--media_type"); s.add_argument("--content_class")
     s.add_argument("--tags", default=""); s.add_argument("--since")
     s.add_argument("--top_k", type=int, default=10)
     s.add_argument("--candidates", type=int, default=4000)
@@ -1476,7 +1797,7 @@ def main():
     sk = sub.add_parser("skill")   # 独立工具 mh_skill（2026-09-18 老大拍板重做）
     sk.add_argument("--agent", default="", help="你自己的 agent 名 —— 写入闸门第 1 关靠它放行")
     sk.add_argument("--detail", default="", help='full = 附完整手册；默认只给核心规矩')
-    sk.add_argument("--topic", default="", help="按章节标题抽段，如 闸门 / 工具 / Web API")
+    sk.add_argument("--topic", default="", help="按节取：读/写/技能/代码/坑表/铁律（坑表+铁律恒附）；缺省=全文")
     sk.set_defaults(func=cmd_skill)
 
     tc = sub.add_parser("tool_create")
@@ -1493,6 +1814,12 @@ def main():
     ib = sub.add_parser("import_batch"); ib.add_argument("--file", required=True)
     ib.set_defaults(func=cmd_import_batch)
 
+    rs = sub.add_parser("register_skill", help="openmem 原生技能入库：把 SKILL.md 拆成 名片层(uskill_idx)+详情层(uskill_doc)")
+    rs.add_argument("--file", action="append", help="SKILL.md 路径，可重复多次")
+    rs.add_argument("--all", action="store_true", help="扫 ~/.workbuddy/skills/*/SKILL.md（慎用，会连协议类一起迁）")
+    rs.add_argument("--agent", default="openmem", help="写入方 agent 名（闸门记账用）")
+    rs.set_defaults(func=cmd_register_skill)
+
     gt = sub.add_parser("gate", help="写入闸门状态 / 重置（2026-09-18）")
     gt.add_argument("--status", action="store_true", help="看闸门状态（默认行为）")
     gt.add_argument("--reset", metavar="SOURCE", help="清某个 agent 的闸门留痕（票 / 搜索时刻 / 拦截计数）")
@@ -1508,6 +1835,7 @@ def main():
     dp.add_argument("--id", required=True, help="要下线的条目 id（短前缀即可）")
     dp.add_argument("--supersede", help="保留条 id（合并后的活条目）")
     dp.add_argument("--restore", action="store_true", help="反悔：清掉 superseded_by")
+    dp.add_argument("--hard", action="store_true", help="🔴 硬删（真 DELETE，不可逆）：物理删除该条；会先清空指向它的退休引用防悬链。务必确认 id 正确再传")
     dp.set_defaults(func=cmd_deprecate)
 
     sub.add_parser("status").set_defaults(func=cmd_status)

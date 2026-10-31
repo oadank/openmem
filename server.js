@@ -15,7 +15,7 @@
  *   mh_get     按 id 取单条
  *   mh_ask     AI 对 AI 咨询：像问老大本人一样，给完整准确答案（litellm GwV4F）
  *   mh_tool    预生成答案工具：标准化提示词，直接拿最新备好的答案（秒回）
- *   mh_skill   写入规矩（写入闸门第 1 关的准入入口；默认只给核心版，detail=full 才给手册）
+ *   mh_skill   写入规矩（写入闸门第 1 关的准入入口；默认全文，topic= 按节分发，坑表恒附、铁律随写类节附）
  *   mh_tools_list / mh_status
  */
 
@@ -23,6 +23,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
+import { appendFileSync } from 'fs';
 import { spawn } from 'child_process';
 import { createServer } from 'http';
 import { randomUUID } from 'crypto';
@@ -93,7 +94,7 @@ function createOpenmemServer() {
       content: z.string().min(1).max(20000).describe('记忆内容正文'),
       source: z.string().min(1).max(100).describe('写入方 agent 名，如 codex / dsh / WorkBuddy'),
       layer: z.enum(['k', 'm']).default('k').describe('k=知识 m=记忆'),
-      category: z.string().max(100).default('misc').describe('rules/facts/projects/lessons/knowledge/archive/verification/services/capabilities/misc，或项目名如 dsh / agents-to-feishu'),
+      category: z.string().max(100).default('misc').describe('rules/facts/projects/lessons/knowledge/archive/verification/services/capabilities/misc，或项目名如 dsh / agents-to-feishu。🔴 技能入库别用本工具手写 uskill_idx/uskill_doc，走 mh_register_skill（正文只在文件里，库只存路径）'),
       tags: z.array(z.string()).default([]).describe('标签列表'),
       confidence: z.number().min(0).max(1).default(0.5),
       pinned: z.boolean().default(false).describe('关键事实钉住，免疫自动归档')
@@ -133,7 +134,7 @@ function createOpenmemServer() {
       } catch (e) { return T(`更新失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_search', '检索老大的统一记忆，返回**原始条目**（适合查历史细节、具体事件、某个坑的完整经过）。混合检索：向量语义 + 元数据过滤(layer/category/source/tags/时间)。⚠️ 但「老大是什么人 / 什么偏好 / 本机环境 / 服务与端口 / 某项目怎么改」这类**标准问题请先试 mh_tools_list → mh_tool**（成品答案，秒回、后台已保鲜），不要直接搜、更不要猜。注意：nssm 服务台账（agent-matrix/services）默认不返回，要查某服务的启动参数/端口用 source="agent-matrix" 显式指定。🔴 硬规矩：访问 GitHub 或任何需凭据/代理的外部 API 前，必须先在此搜访问方法（如 query="GitHub 凭据"）再动手；报限流/403 先怀疑没走通道，禁止空手重试。⚠️ 提示词库（layer=p）已与本记忆池分池，本工具**搜不到提示词**：找配方/**生图取词**都用 mh_pr_search / mh_pr_best / mh_pr_random（人像场景传 kind="wildcards"），写入用 mh_pr_write —— 严禁把提示词用 mh_write 写回记忆池（会污染经验检索）。',
+  s.tool('mh_search', '检索老大的统一记忆，返回**原始条目**（适合查历史细节、具体事件、某个坑的完整经过）。混合检索：向量语义 + 元数据过滤(layer/category/source/tags/时间)。⚠️ 但「老大是什么人 / 什么偏好 / 本机环境 / 服务与端口 / 某项目怎么改」这类**标准问题请先试 mh_tools_list → mh_tool**（成品答案，秒回、后台已保鲜），不要直接搜、更不要猜。注意：nssm 服务台账（agent-matrix/services）默认不返回，要查某服务的启动参数/端口用 source="agent-matrix" 显式指定。🔴 硬规矩：访问 GitHub 或任何需凭据/代理的外部 API 前，必须先在此搜访问方法（如 query="GitHub 凭据"）再动手；报限流/403 先怀疑没走通道，禁止空手重试。⚠️ 提示词库（layer=p）已与本记忆池分池，本工具**搜不到提示词**：找配方/**生图取词**都用 mh_pr_search / mh_pr_best / mh_pr_random（人像场景传 kind="img_char_sfw"），写入用 mh_pr_write —— 严禁把提示词用 mh_write 写回记忆池（会污染经验检索）。🔴 通用前置闸门（对所有接入 openmem 的 agent 生效，不靠单个人设）：接到任务、动手前，先以 category="uskill_idx" 调本工具查技能库（top_k=3），命中现成技能就照着做、别重造；对所有 agent（workbuddy/claude/codex/dsh/mimo/codebuddy…）通用。',
     {
       query: z.string().min(1).max(2000).describe('查询问题或关键词'),
       layer: z.enum(['k', 'm']).optional(),
@@ -147,11 +148,20 @@ function createOpenmemServer() {
     },
     async (p) => {
       try {
+        const alog = (s) => { try { appendFileSync('C:/D/opt/openmem/access.log', `[${new Date().toISOString()}] ${s}\n`); } catch (_) {} };
+        alog(`SEARCH requester=${p.requester || 'mcp-client'} category=${p.category || '-'} query=${JSON.stringify(p.query).slice(0, 200)}`);
         const a = ['search', '--query', p.query, '--top_k', String(p.top_k),
           '--tags', (p.tags || []).join(','), '--requester', String(p.requester || 'mcp-client')];
         for (const k of ['layer', 'category', 'source', 'since']) if (p[k]) a.push(`--${k}`, p[k]);
         if (p.include_archived) a.push('--include_archived');
-        return J(parseCore(await runCore(a)));
+        const res = parseCore(await runCore(a));
+        try {
+          const r = (res && res.results) || (res && res.entries) || [];
+          const top = r[0];
+          if (top) alog(`  -> top1 id=${top.id} score=${top.score} content=${(String(top.content || '')).replace(/\n/g, ' ').slice(0, 90)}`);
+          else alog('  -> no hit');
+        } catch (_) {}
+        return J(res);
       } catch (e) { return T(`检索失败: ${e.message}`, true); }
     });
 
@@ -176,16 +186,18 @@ function createOpenmemServer() {
       } catch (e) { return T(`体检失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_deprecate', '【软删/退休 · 2026-09-25 加】把一条记忆标记 superseded_by 指向保留条：它立刻从检索、查重、体检里消失，**但原文仍在库里**，传 restore=true 可复原。用于"两条确认是同一件事，已 mh_update 合并到保留条，这条该下线"。🔴 为什么必须有它：取代关系**只写在正文里机器读不到**（曾有两条正文互称"本条取代 X"而 X 依然 pinned 活着被查出来当新内容）；而本库没有任何硬删通道，裸删不可逆。⚠️ 规矩：先 mh_update 保留条把增量并进去，再 deprecate 旧的；**不做无痕删除**（不给 supersede 会被拒）。',
+  s.tool('mh_deprecate', '【下线/删除 · 2026-09-25 加】两种模式：① 软删（默认）：标记 superseded_by 指向保留条，立刻从检索/查重/体检消失，原文仍在，传 restore=true 复原——用于"两条是同一件事，已合并到保留条"。② 🔴 硬删（传 hard=true）：真 DELETE 物理删除，不可逆，会先清空指向它的退休引用防悬链。**调用硬删前必须向用户确认 id 正确**，误删只能从 _backup_*.sql 恢复。⚠️ 规矩：优先软删；硬删只用于确认彻底无用的条目。',
     {
-      id: z.string().regex(/^[0-9a-fA-F][0-9a-fA-F-]{4,34}[0-9a-fA-F]$/).describe('要下线的条目 id（uuid 或 ≥6 位短前缀）'),
+      id: z.string().regex(/^[0-9a-fA-F][0-9a-fA-F-]{4,34}[0-9a-fA-F]$/).describe('要下线/删除的条目 id（uuid 或 ≥6 位短前缀）'),
       supersede: z.string().regex(/^[0-9a-fA-F][0-9a-fA-F-]{4,34}[0-9a-fA-F]$/).optional().describe('保留条 id（合并后的活条目）；restore 时可省'),
-      restore: z.boolean().default(false).describe('true=反悔复原（清掉 superseded_by）')
+      restore: z.boolean().default(false).describe('true=反悔复原（清掉 superseded_by）'),
+      hard: z.boolean().default(false).describe('🔴 true=硬删（物理 DELETE，不可逆），调用前必须确认 id')
     },
     async (p) => {
       try {
         const a = ['deprecate', '--id', p.id];
         if (p.restore) a.push('--restore');
+        else if (p.hard) a.push('--hard');
         else if (p.supersede) a.push('--supersede', p.supersede);
         return J(parseCore(await runCore(a, 60000)));
       } catch (e) { return T(`下线失败: ${e.message}`, true); }
@@ -209,13 +221,14 @@ function createOpenmemServer() {
       } catch (e) { return T(`咨询失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_skill', '【必须先调用】openmem 写入规矩 —— 往 openmem 写记忆（mh_write）前的准入门槛。返回**核心写入规矩**（一页准入条文：写入四步 / 三道闸门 / 一句话原则），不走 LLM、秒回。**没有"完整手册"这回事**（MANUAL.md 已于 2026-09-18 删除 —— 该留的都塞进了各 agent 的 openmem 技能文件）。⚠️ 被写入闸门第 1 关拦下时，调用本工具（**带 agent**）即可放行 —— 不带 agent 不计入你名下、会继续被拦。**票制：领一次只放行一条 —— 写成功这条票就作废，下次再写还得回来再领一次。**',
+  s.tool('mh_skill', '【接入必读·总交代】openmem 读 + 写 + 加技能的全部规矩，一次说清（不走 LLM、秒回）：① 读侧——mh_status 看 capabilities、mh_tool 取成品答案、联网 / 调外部 API 前先搜 openmem；② 写侧——写入四步 + 三道闸门（被第 1 关拦下时，调本工具**带 agent** 即放行，不带 agent 继续被拦）；③ 加技能——mh_register_skill。🔴 票制：领一次只放行一条，写成功即作废，下次再写还得回来领。**这是唯一交代入口，没有第二份手册。** 省 token 可带 topic=读|写|技能|代码|坑表 只取一节（坑表恒附；铁律随写类节附上，读节不带），不带 = 全文。',
     {
-      agent: z.string().max(100).optional().describe('你自己的 agent 名（如 claude / codex / mimo / workbuddy / dsh）。**必填** —— 闸门靠它记账；不填则第 1 关会继续拦你。')
+      agent: z.string().max(100).optional().describe('你自己的 agent 名（如 claude / codex / mimo / workbuddy / dsh）。**必填** —— 闸门靠它记账；不填则第 1 关会继续拦你。'),
+      topic: z.string().max(20).optional().describe('按节取：读 / 写 / 技能 / 代码 / 坑表（含铁律；读节只附坑表），不中回落全文；缺省 = 全文')
     },
     async (p) => {
       try {
-        const a = ['skill', '--agent', p.agent || ''];
+        const a = ['skill', '--agent', p.agent || '', '--topic', p.topic || ''];
         return J(parseCore(await runCore(a)));
       } catch (e) { return T(`领规矩失败: ${e.message}`, true); }
     });
@@ -241,7 +254,7 @@ function createOpenmemServer() {
       catch (e) { return T(`失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_status', 'openmem 健康状态：总条数/钉住数/归档数/待审冲突/工具数/咨询次数。', {},
+  s.tool('mh_status', 'openmem 健康状态：总条数/钉住数/归档数/待审冲突/工具数/咨询次数，外加 capabilities（openmem 原生能力声明——接上即自带，零人设）。', {},
     async () => {
       try {
         const raw = await runCore(['status']);
@@ -249,19 +262,34 @@ function createOpenmemServer() {
         for (const line of raw.trim().split('\n').filter(Boolean)) {
           const o = JSON.parse(line); metrics[o.metric] = o.value;
         }
-        return J({ ok: true, ...metrics });
+        // 🔴 能力自声明：任何接入 openmem 的 agent 调 mh_status 即自动获得，无需改人设
+        const capabilities = [
+          { tool: 'mh_register_skill', intent: '把某技能加入/注册进 openmem 技能库', triggers: ['把 X 加入技能库', '注册技能', '登记技能', '让 openmem 学会 X 技能', '把某 SKILL.md 收进记忆'], arg: 'file=SKILL.md 绝对路径数组' },
+          { tool: 'mh_search', intent: '语义搜记忆/知识/技能名片', triggers: ['查一下 openmem', '有没有相关的...', '我记得...'], arg: 'query + 可选 category' },
+          { tool: 'mh_write', intent: '写入一条记忆/知识', triggers: ['记一下', '把结论存进 openmem'], arg: '需先 mh_skill 领票' }
+        ];
+        // 🔴 通用前置闸门：对所有接入 openmem 的 agent 生效，不靠单个人设。WorkBuddy/CodeBuddy 桌面端已用 UserPromptSubmit hook 自动执行，这里再广播一次兜底。
+        const skill_gate = {
+          rule: '接到任务、动手前，先 mh_search(category="uskill_idx", top_k=3) 查技能库；命中现成技能就照着做，没命中再自己干。',
+          cost: '约 2KB/次、恒定（与技能总数无关），不浪费 token；反而省——避免每个 agent 重造已存在的技能。',
+          why: '对所有接入 openmem 的 agent（workbuddy/claude/codex/dsh/mimo/codebuddy…）通用，写在 openmem 层，不依赖任何客户端的人设或记忆。',
+          hook: 'WorkBuddy/CodeBuddy 桌面端已挂 UserPromptSubmit hook 自动执行此闸门；其他客户端靠本广播 + 各自 SessionStart hook。'
+        };
+        return J({ ok: true, ...metrics, capabilities, skill_gate });
       } catch (e) { return T(`失败: ${e.message}`, true); }
     });
 
   // ── 提示词库专用工具组（mh_pr_*，layer='p'）───────────────────
   // 与经验记忆彻底分池：写死 layer='p'，默认 mh_search 检索不到它们（见 mem_core _filters）。
   // 正文仍以 git prompt-lib 为真源，这里只存「索引卡 + 评分 + 定位」，kind 即 category。
-  const PR_KINDS = "kind=提示词类别，当前约定 h3（MiniMax H3 生视频）/ qwen-image（Qwen-Image-2.1 生图编辑）；用新类别先与老大确认";
+  const PR_KINDS = "kind=提示词类别（按 媒体类型_内容大类_子类 命名，如 img_scene_xianxia / vid_h3 / img_char_sfw）；media_type=img图片/vid视频/mus音乐，content_class=scene场景/char人物/animal动物/object器物；用新类别先与老大确认";
 
   s.tool('mh_pr_write', '【提示词库·写入】把一条提示词索引卡写进独立的 prompt 库（layer=p，与记忆分池，不进 mh_search）。存的是「用途+适用模型(kind)+git正文路径+规则指纹+实测评分/seed」这类索引，不塞正文全文（正文在 git prompt-lib，防多真源漂移）。写前同样要先 mh_pr_search 查重、按提示领 mh_skill 票。' + PR_KINDS,
     {
       content: z.string().min(1).max(6000).describe('索引卡正文：这条提示词干什么/适用什么/正文在 git 哪个文件/实测结论'),
-      kind: z.string().max(40).default('h3').describe(PR_KINDS),
+      kind: z.string().max(40).default('vid_h3').describe(PR_KINDS),
+      media_type: z.string().max(20).optional().describe('产出类型：img 图片 / vid 视频 / mus 音乐'),
+      content_class: z.string().max(20).optional().describe('内容大类：scene 场景 / char 人物 / animal 动物 / object 器物'),
       source: z.string().max(100).default('dsh').describe('写入方 agent 名（闸门记账用）'),
       tags: z.array(z.string()).default([]),
       confidence: z.number().min(0).max(1).default(0.6),
@@ -272,15 +300,19 @@ function createOpenmemServer() {
         const a = ['write', '--layer', 'p', '--category', p.kind, '--source', p.source,
           '--content', p.content, '--confidence', String(p.confidence)];
         if (p.tags && p.tags.length) a.push('--tags', p.tags.join(','));
+        if (p.media_type) a.push('--media_type', p.media_type);
+        if (p.content_class) a.push('--content_class', p.content_class);
         if (p.pinned) a.push('--pinned');
         return J(parseCore(await runCore(a)));
       } catch (e) { return T(`提示词写入失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_pr_search', '【提示词库·检索】只在 prompt 库（layer=p）里搜，绝不混进经验记忆。要"H3 换脸怎么写不崩""Qwen 编辑提示词模板"这类现成配方就用它，传 kind 直达该类别。🔴 生图取词主入口：传 kind="wildcards" = 按场景语义搜整段人像提示词（如"秋天树下美女""雪地黑大衣""咖啡馆窗边"），返回可直接用的完整段落——任何生图/画图任务第一步先来这里取词，禁止从零手编 prompt。',
+  s.tool('mh_pr_search', '【提示词库·检索】只在 prompt 库（layer=p）里搜，绝不混进经验记忆。要"H3 换脸怎么写不崩""Qwen 编辑提示词模板"这类现成配方就用它，传 kind 直达该类别。🔴 生图取词主入口：传 kind="img_char_sfw" = 按场景语义搜整段人像提示词（如"秋天树下美女""雪地黑大衣""咖啡馆窗边"），返回可直接用的完整段落——任何生图/画图任务第一步先来这里取词，禁止从零手编 prompt。',
     {
       query: z.string().min(1).max(2000).describe('要找什么提示词/场景'),
-      kind: z.string().max(40).optional().describe('限定类别：h3 / qwen-image / wildcards（人像场景素材池，生图取词用这个）；留空=搜全部提示词'),
+      kind: z.string().max(40).optional().describe('限定类别：vid_h3（H3视频）/ qwen-image / img_char_sfw（美女人像）/ img_scene_xianxia（仙侠场景）等；留空=搜全部提示词'),
+      media_type: z.string().max(20).optional().describe('硬性筛：只返回 img 图片 / vid 视频 / mus 音乐'),
+      content_class: z.string().max(20).optional().describe('硬性筛：只返回 scene 场景 / char 人物 / animal 动物 / object 器物'),
       tags: z.array(z.string()).default([]),
       top_k: z.number().min(1).max(50).default(10),
       requester: z.string().max(100).optional()
@@ -290,13 +322,17 @@ function createOpenmemServer() {
         const a = ['search', '--layer', 'p', '--query', p.query, '--top_k', String(p.top_k),
           '--tags', (p.tags || []).join(','), '--requester', String(p.requester || 'mcp-client')];
         if (p.kind) a.push('--category', p.kind);
+        if (p.media_type) a.push('--media_type', p.media_type);
+        if (p.content_class) a.push('--content_class', p.content_class);
         return J(parseCore(await runCore(a)));
       } catch (e) { return T(`提示词检索失败: ${e.message}`, true); }
     });
 
   s.tool('mh_pr_best', '【提示词库·最佳配方】按类别取"当前最该用"的提示词（pinned/高置信优先排序）。要"H3 现在最好用那版""换脸最稳的那条"秒回，不必自己翻。',
     {
-      kind: z.string().max(40).default('h3').describe(PR_KINDS),
+      kind: z.string().max(40).default('vid_h3').describe(PR_KINDS),
+      media_type: z.string().max(20).optional().describe('硬性筛：只返回 img 图片 / vid 视频 / mus 音乐'),
+      content_class: z.string().max(20).optional().describe('硬性筛：只返回 scene 场景 / char 人物 / animal 动物 / object 器物'),
       hint: z.string().max(400).default('').describe('可选：进一步限定场景，如 换脸 / 快节奏舞蹈'),
       top_k: z.number().min(1).max(20).default(5)
     },
@@ -304,6 +340,8 @@ function createOpenmemServer() {
       try {
         const q = (p.hint || '最佳 推荐 best 配方 通用').trim();
         const a = ['search', '--layer', 'p', '--category', p.kind, '--query', q, '--top_k', String(p.top_k)];
+        if (p.media_type) a.push('--media_type', p.media_type);
+        if (p.content_class) a.push('--content_class', p.content_class);
         const r = parseCore(await runCore(a));
         const list = (r && (r.results || r.entries || r)) || [];
         if (Array.isArray(list)) {
@@ -320,9 +358,22 @@ function createOpenmemServer() {
       catch (e) { return T(`读取失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_pr_random', '【wildcards·随机抽取】从本地 wildcards 素材库（SFW 人像/自拍整段提示词，5500+ 条）随机抽**一条完整提示词**，直接可当生图 prompt 用。🔴 任何生图/画图任务第一步必须先来这里取词（定向场景用 mh_pr_search 传 kind="wildcards"，无特定要求就本工具抽签），拿到整段再按需加工，禁止从零手编 prompt。与经验记忆/提示词配方库三方隔离（不进库、不进任何检索）。',
+  s.tool('mh_register_skill', '【技能·入库】openmem 原生能力。**🔴 当用户说「把 X 加入/注册技能库」「登记技能」「让 openmem 学会 X 技能」「把某 SKILL.md 收进记忆」时，直接调用本工具——不用问命令、不用改人设，openmem 接上即自带此能力。** 把一个或多个 SKILL.md 登记进技能库，自动拆两层：名片层 uskill_idx（技能名 + 何时用≤300字 + **【正文】真源绝对路径**，检索唯一入口）+ 详情层 uskill_doc（**≤1200 字摘要**：讲什么 + 章节大纲 + 真源路径；mh_get(id) 取摘要）。🔴 **架构铁律：技能正文永远在文件里，openmem 只做索引 + 路径**——不存 SKILL.md 全文（BGE 只算前 512 token，存了后半截也永远搜不到；且必然「库里旧、文件新」双份过期）。判据：这内容改了会不会出现库里旧/文件新两个版本？会 → 只写路径。改架构前先 mh_get("9503b404")。语义触发（意思相近也能命中）、注入恒定（检索只碰名片层，与技能总数无关）。重复登记同名按 content_hash 自动跳过。file 传 SKILL.md 绝对路径数组，如 ["C:/Users/oadan/.workbuddy/skills/xdn-remote-ops/SKILL.md"]。',
     {
-      file: z.string().max(100).optional().describe('词库文件名（_local/wildcards/ 下，如 sfw_portrait_v3），不给则随机选一个')
+      file: z.array(z.string()).min(1).describe('SKILL.md 文件路径数组，如 ["C:/Users/oadan/.workbuddy/skills/xdn-remote-ops/SKILL.md"]'),
+      agent: z.string().max(100).default('openmem').describe('写入方 agent 名（闸门记账用）')
+    },
+    async (p) => {
+      try {
+        const a = ['register_skill', '--agent', p.agent];
+        for (const f of p.file) a.push('--file', f);
+        return J(parseCore(await runCore(a)));
+      } catch (e) { return T(`技能入库失败: ${e.message}`, true); }
+    });
+
+  s.tool('mh_pr_random', '【wildcards·随机抽取】从本地 wildcards 素材库（SFW 人像/自拍整段提示词，5500+ 条）随机抽**一条完整提示词**，直接可当生图 prompt 用。🔴 任何生图/画图任务第一步必须先来这里取词（定向场景用 mh_pr_search 传 kind="img_char_sfw"，无特定要求就本工具抽签），拿到整段再按需加工，禁止从零手编 prompt。与经验记忆/提示词配方库三方隔离（不进库、不进任何检索）。',
+    {
+      file: z.string().max(100).optional().describe('词库文件名（_local/wildcards/ 下，如 img_char_sfw_portrait），不给则随机选一个')
     },
     async (p) => {
       try {
@@ -430,13 +481,12 @@ async function main() {
         await s.transport.handleRequest(req, res, pb);
         return;
       }
-      // 带 id 但未命中（服务重启/TTL 过期）→ 404，客户端应重新 initialize
+      // 带 id 但未命中（TTL 过期/服务重启）：不再返回 404，改为现场新建实例按无状态处理。
+      // openmem 工具本身不依赖会话状态，客户端用旧 sid 也能直接成功，无需重连 → 根除 Session not found。
+      // 内部 30 分钟空闲清理仍照常运行（防句柄泄漏），但被清理后请求照样能 served，用户侧不再感知"断开"。
       if (sid) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null
-        }));
-        return;
+        console.error(`[http] sid=${sid} 未命中（已过期/重启），按无状态现场处理（兜底防 Session not found）`);
+        // 不 return，落到下方「无 session id」分支新建实例处理
       }
 
       // 无 session id → 按请求类型分流（2026-09-30 修复回归）：
