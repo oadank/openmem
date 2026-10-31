@@ -1478,7 +1478,7 @@ def build_skill_table():
          f"硬异常 {hard}（死链 {bad['missing']} / 名片旧 {bad['stale']} / 无中文 {bad['nozh']} / 手写 {bad['manual']}）"
          f" ｜ 提示 {bad['notrig']}（真源没写「触发词：」）"),
         "",
-        "| 技能 | 触发词（取自真源 description） | 真实目录 | 状态 | 提示 |",
+        "| 技能 | 触发词（从真源读出，统一用「、」分隔） | 真实目录 | 状态 | 提示 |",
         "|---|---|---|---|---|",
     ]
     lines += ["| " + " | ".join(_md_cell(x) for x in r) + " |" for r in body]
