@@ -1661,7 +1661,10 @@ def _parse_skill_front(text):
 
 
 def _skill_triggers(desc):
-    m = re.search(r"触发词[:：](.+)", desc)
+    """抽「触发词：」列表。🔴 必须止于第一个句号/换行：早期用 `(.+)` 贪婪取到行尾，
+    把后面的原描述整段当成词条（"写代码前。agents-to-feishu 开发强制流程。触发条件…"），
+    既污染名片 tags，也让技能库总表的触发词列变成一锅粥（2026-10-31 抓到）。"""
+    m = re.search(r"触发词[:：]([^。\n]+)", desc)
     if not m:
         return []
     return [t.strip() for t in re.split(r"[、,，/]", m.group(1)) if t.strip()][:12]
