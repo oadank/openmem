@@ -1352,8 +1352,150 @@ def generate_tool_answer(tool_name, prompt_template):
     ], cfg=cfg)
     return answer, refs
 
+# ── 技能库总表（2026-10-31 老大拍板）：代码实时拼，不走 AI、不缓存 ──────────
+#   🔴 为什么不建成普通 preset_tools：那张表是「LLM 生成 → 落库缓存 → 到期/手工 force_refresh」，
+#      天然会漂（库里旧、现场新），生成一次还 180s。技能表只有几十行，每次现拼 10ms，
+#      索性永远读现场 —— 加技能/改 desc 立刻反映，不存在第二份真源。
+SKILL_TABLE_NAMES = {"技能库总表", "技能总表", "技能索引", "skills_index"}
+SKILL_DIR_ALIAS = (
+    (r"c:\users\oadan\.workbuddy\skills", "WB"),
+    (r"c:\d\opt\agents-to-feishu\skills", "ATF"),
+)
+
+
+def _card_parts(content):
+    """拆名片三行；缺行返空串（手写名片可能没有【正文】）。
+
+    🔴【何时用】可能跨多行（真源 description 含换行时，brief=desc[:150] 会带进来），
+       所以取到下一个【…】标记为止再拼回一行 —— 只读首行会把多行 brief 截断，
+       与真源比较永远不等，整张表误报「名片旧」（2026-10-31 实测踩到）。"""
+    name = when = path = ""
+    lines = (content or "").splitlines()
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("【技能】"):
+            name = s[len("【技能】"):].strip()
+        elif s.startswith("【何时用】"):
+            when = s[len("【何时用】"):].strip()
+            for nxt in lines[i + 1:]:
+                t = nxt.strip()
+                if t.startswith("【"):
+                    break
+                when = (when + " " + t).strip()
+        elif s.startswith("【正文】"):
+            path = s[len("【正文】"):].strip()
+    return name, when, path
+
+
+def _norm_ws(s):
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def _skill_desc_of(text):
+    """真源 description。_parse_skill_front 只认单行，块标量（> | >- |-）在这里兜底。"""
+    _, d = _parse_skill_front(text)
+    if not d or len(d) < 4 or d.rstrip("-|>").strip() == "":
+        m = re.search(r"description:\s*[>|]-?\s*\n((?:[ \t]+.*\n)+)", text[:4000])
+        if m:
+            d = " ".join(x.strip() for x in m.group(1).splitlines()).strip()
+    return d
+
+
+def build_skill_table():
+    """实时拼技能库总表（markdown）：现读 uskill_idx + 现读真源文件校验。不缓存。"""
+    conn = connect(); cur = conn.cursor()
+    cur.execute("""SELECT id, content FROM memory_entries
+                   WHERE category=%s AND superseded_by IS NULL ORDER BY content""", (USKILL_IDX,))
+    rows = cur.fetchall(); cur.close(); conn.close()
+
+    body, bad = [], {"missing": 0, "stale": 0, "nozh": 0, "notrig": 0, "manual": 0}
+    for _id, content in rows:
+        name, when, path = _card_parts(content)
+        name = name or "（无名）"
+        if not path:
+            body.append((name, "—", "—", "手写名片（无【正文】路径）", ""))
+            bad["manual"] += 1
+            continue
+        norm = os.path.normcase(path)
+        loc = ""
+        for pref, ab in SKILL_DIR_ALIAS:
+            if norm.startswith(os.path.normcase(pref)):
+                loc = ab
+                break
+        if not loc:
+            loc = os.path.dirname(path) or "?"
+        d1 = os.path.dirname(path)
+        try:
+            if d1 and os.path.normcase(os.path.realpath(d1)) != os.path.normcase(d1):
+                # 链接显式标出真源落点：WB 那条只是传送门，改的是 ATF 那唯一一份
+                real = os.path.normcase(os.path.realpath(d1))
+                tgt = next((ab for pref, ab in SKILL_DIR_ALIAS
+                            if real.startswith(os.path.normcase(pref))), "")
+                if not tgt:      # 第三方软件自带（如 ego lite），升级会覆盖 —— 更要标出来
+                    tgt = "…" + os.sep.join(os.path.realpath(d1).split(os.sep)[-2:])
+                loc += f"（链接→{tgt}）"
+        except Exception:
+            pass
+        if not os.path.isfile(path):
+            body.append((name, "—", loc, "🔴 死链：文件不存在", ""))
+            bad["missing"] += 1
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except Exception as e:
+            body.append((name, "—", loc, f"🔴 读不了：{e}", ""))
+            bad["missing"] += 1
+            continue
+        desc = _skill_desc_of(text)
+        trig = _skill_triggers(desc)[:8]
+        flags, hints = [], []
+        if not desc:
+            flags.append("真源无 description")
+        if when and desc and _norm_ws(when) != _norm_ws(desc[:150]):
+            flags.append("名片旧（真源已改，重注册才刷新）")
+            bad["stale"] += 1
+        if len(re.findall(r"[\u4e00-\u9fff]", desc)) < 5:
+            flags.append("无中文触发词（中文提问搜不到）")
+            bad["nozh"] += 1
+        if not trig:
+            hints.append("无「触发词：」")
+            bad["notrig"] += 1
+        body.append((name, "、".join(trig) or "—", loc, " / ".join(flags) or "OK", " / ".join(hints)))
+
+    total = len(rows)
+    hard = bad["missing"] + bad["stale"] + bad["nozh"] + bad["manual"]
+    lines = [
+        "# openmem 技能库总表（代码实时拼：不缓存、不走 AI、每次现读）",
+        "",
+        (f"生成：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ｜ 名片 {total} 张 ｜ "
+         f"硬异常 {hard}（死链 {bad['missing']} / 名片旧 {bad['stale']} / 无中文 {bad['nozh']} / 手写 {bad['manual']}）"
+         f" ｜ 提示 {bad['notrig']}（真源没写「触发词：」）"),
+        "",
+        "| 技能 | 触发词（取自真源 description） | 真实目录 | 状态 | 提示 |",
+        "|---|---|---|---|---|",
+    ]
+    lines += ["| " + " | ".join(r) + " |" for r in body]
+    lines += [
+        "",
+        "目录缩写：" + " ｜ ".join(f"{ab} = {p}" for p, ab in SKILL_DIR_ALIAS) + "（带「链接」= Junction，改真源那唯一一份，两边同时生效）",
+        "",
+        "怎么用：命中技能 → 直接 `read` 上面真实目录里的 `SKILL.md`（正文永远以文件为准），或 `mh_get(详情 id)` 取摘要。",
+        "状态：OK ｜ 名片旧 = 名片【何时用】与真源 description 前 150 字已不一致 ｜ 死链 = 文件不存在 ｜ 无中文触发词 = desc 里几乎没有中文，中文提问检索不到 ｜ 手写名片 = 无【正文】路径，无从校验。",
+        "提示列不算错：没写「触发词：」的技能只能靠自然语言描述匹配，命中率天然低于写了触发词的。",
+    ]
+    return "\n".join(lines)
+
+
 def cmd_tool_call(a):
     agent = (getattr(a, "agent", "") or "").strip()
+
+    # ── 技能库总表（2026-10-31）：代码实时拼，先于 preset_tools 查表 ──────────
+    if (a.name or "").strip() in SKILL_TABLE_NAMES:
+        ans = build_skill_table()
+        out({"ok": True, "name": "技能库总表", "answer": ans, "cached": False,
+             "from_code": True, "chars": len(ans)})
+        return
 
     # ── 领规矩（真源 RULES.md，本地文件直读：不走 AI 生成、不动库）────────────
     # 2026-09-18 老大定：闸门要的是「领规矩」这个动作 —— 规矩是精简准入条文。
@@ -1443,9 +1585,17 @@ def cmd_tools_list(a):
     cur.execute("""SELECT name, description, answer_updated_at, enabled, refresh_interval
                    FROM preset_tools ORDER BY name""")
     rows = cur.fetchall(); cur.close(); conn.close()
-    out({"ok": True, "tools": [{"name": r[0], "description": r[1],
-        "answer_updated_at": r[2].isoformat() if r[2] else None,
-        "enabled": r[3], "refresh_interval": str(r[4])} for r in rows]})
+    tools = [{"name": r[0], "description": r[1],
+              "answer_updated_at": r[2].isoformat() if r[2] else None,
+              "enabled": r[3], "refresh_interval": str(r[4])} for r in rows]
+    # 代码直出的工具不进 preset_tools（那张表是 LLM 生成 + 缓存配置，塞进去会被
+    # cmd_tool_refresh 当成待刷新项白烧一次生成），在这里追加虚拟条目让 agent 能发现。
+    tools.append({"name": "技能库总表",
+                  "description": "全部技能：名片是否有效 / 触发词 / 真实目录（代码实时拼，永远最新，无需刷新）",
+                  "answer_updated_at": None, "enabled": True,
+                  "refresh_interval": "realtime（代码直出）"})
+    tools.sort(key=lambda t: t["name"])
+    out({"ok": True, "tools": tools})
 
 
 # ── 批量导入 / 状态 ──────────────────────────────────────
@@ -1797,7 +1947,7 @@ def main():
     sk = sub.add_parser("skill")   # 独立工具 mh_skill（2026-09-18 老大拍板重做）
     sk.add_argument("--agent", default="", help="你自己的 agent 名 —— 写入闸门第 1 关靠它放行")
     sk.add_argument("--detail", default="", help='full = 附完整手册；默认只给核心规矩')
-    sk.add_argument("--topic", default="", help="按节取：读/写/技能/代码/坑表/铁律（坑表+铁律恒附）；缺省=全文")
+    sk.add_argument("--topic", default="", help="按节取：读/写/技能/代码/坑表（坑表恒附、铁律随写类节附；读节不附）；缺省=全文")
     sk.set_defaults(func=cmd_skill)
 
     tc = sub.add_parser("tool_create")
@@ -1810,6 +1960,9 @@ def main():
     tr.set_defaults(func=cmd_tool_refresh)
 
     sub.add_parser("tools_list").set_defaults(func=cmd_tools_list)
+
+    si = sub.add_parser("skills_index", help="打印技能库总表（实时拼，等同 mh_tool 的「技能库总表」）")
+    si.set_defaults(func=lambda a: out({"ok": True, "answer": build_skill_table()}))
 
     ib = sub.add_parser("import_batch"); ib.add_argument("--file", required=True)
     ib.set_defaults(func=cmd_import_batch)

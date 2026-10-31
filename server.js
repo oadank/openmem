@@ -233,9 +233,9 @@ function createOpenmemServer() {
       } catch (e) { return T(`领规矩失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_tool', '【首选 · 秒回】调用预生成答案工具：标准化提示词 + 后台已备好最新最准的答案，**不走 LLM、几乎零等待**。凡「老大是什么人 / 偏好习惯 / 铁律清单 / 本机环境 / 服务与端口 / 12 bot 花名册 / 项目索引」这类**标准问题一律先用这个**，别用 mh_search 现搜、更别凭印象猜。不知道有哪些成品答案就先调 mh_tools_list（一次看清全部 + 新鲜度）。⚠️ 写入规矩请用 mh_skill，别在这里领。',
+  s.tool('mh_tool', '【首选 · 秒回】调用预生成答案工具：标准化提示词 + 后台已备好最新最准的答案，**不走 LLM、几乎零等待**。凡「老大是什么人 / 偏好习惯 / 铁律清单 / 本机环境 / 服务与端口 / 12 bot 花名册 / 项目索引」这类**标准问题一律先用这个**，别用 mh_search 现搜、更别凭印象猜。不知道有哪些成品答案就先调 mh_tools_list（一次看清全部 + 新鲜度）。🔴 其中「技能库总表」是代码实时拼的：技能名 / 触发词 / 真实目录 / 名片是否过期，每次现读、永远最新、无需 force_refresh。⚠️ 写入规矩请用 mh_skill，别在这里领。',
     {
-      name: z.string().min(1).describe('工具名，如 主人的喜好'),
+      name: z.string().min(1).describe('工具名，如 主人的喜好；另有「技能库总表」= 全部技能的名片是否有效/触发词/真实目录（代码实时拼，永远最新）'),
       agent: z.string().max(100).optional().describe('你自己的 agent 名（如 claude / codex / mimo），选填。'),
       force_refresh: z.boolean().default(false).describe('强制重新生成')
     },
