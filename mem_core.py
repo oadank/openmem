@@ -1391,6 +1391,12 @@ def _norm_ws(s):
     return re.sub(r"\s+", " ", s or "").strip()
 
 
+def _md_cell(s):
+    """表格单元格逃生：技能 description 里可能有 `|` 或换行，不转义会直接破表。"""
+    s = str(s if s is not None else "").replace("|", "\\|").replace("\n", " ")
+    return re.sub(r"\s+", " ", s).strip() or "—"
+
+
 def _skill_desc_of(text):
     """真源 description。_parse_skill_front 只认单行，块标量（> | >- |-）在这里兜底。"""
     _, d = _parse_skill_front(text)
@@ -1475,7 +1481,7 @@ def build_skill_table():
         "| 技能 | 触发词（取自真源 description） | 真实目录 | 状态 | 提示 |",
         "|---|---|---|---|---|",
     ]
-    lines += ["| " + " | ".join(r) + " |" for r in body]
+    lines += ["| " + " | ".join(_md_cell(x) for x in r) + " |" for r in body]
     lines += [
         "",
         "目录缩写：" + " ｜ ".join(f"{ab} = {p}" for p, ab in SKILL_DIR_ALIAS) + "（带「链接」= Junction，改真源那唯一一份，两边同时生效）",
@@ -1491,7 +1497,8 @@ def cmd_tool_call(a):
     agent = (getattr(a, "agent", "") or "").strip()
 
     # ── 技能库总表（2026-10-31）：代码实时拼，先于 preset_tools 查表 ──────────
-    if (a.name or "").strip() in SKILL_TABLE_NAMES:
+    _nm = (a.name or "").strip()
+    if _nm in SKILL_TABLE_NAMES or _nm.lower() in SKILL_TABLE_NAMES:
         ans = build_skill_table()
         out({"ok": True, "name": "技能库总表", "answer": ans, "cached": False,
              "from_code": True, "chars": len(ans)})
