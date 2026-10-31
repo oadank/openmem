@@ -1202,6 +1202,8 @@ def cmd_search(a):
                            "content": r[4][:1500], "tags": r[5], "pinned": r[6],
                            "created_at": r[7].isoformat(), "score": round(float(sc), 5),
                            "zh_hit": zh_hit})
+    # —— 别名直通：显式点名工具名（XDN / 8090 / K2 …）→ 对应技能置顶，见 SKILL_ALIAS 注释 ——
+    alias_used = _alias_promote(scored, a.query, cur)
     # —— 检索留痕（2026-09-15）：只记查询与命中 id，供治理用；失败绝不影响检索 ----------
     try:
         conn2 = connect(); cur2 = conn2.cursor()
@@ -1224,7 +1226,7 @@ def cmd_search(a):
     except Exception:
         pass
     cur.close(); conn.close()
-    out({"ok": True, "results": scored, "pool": pool,
+    out({"ok": True, "results": scored, "pool": pool, "alias": alias_used,
          "elapsed_ms": int((time.time() - t0) * 1000)})
 
 def cmd_service(a):
@@ -1361,6 +1363,82 @@ SKILL_DIR_ALIAS = (
     (r"c:\users\oadan\.workbuddy\skills", "WB"),
     (r"c:\d\opt\agents-to-feishu\skills", "ATF"),
 )
+
+# ── 别名直通（2026-10-31）────────────────────────────────────────────────
+# 为什么需要：zh_hit 只统计**中文** 2-gram，`K2`/`Qwen`/`8090`/`XDN`/`ComfyUI` 这类英文数字
+# 工具名根本不参与字面匹配。于是"显式点名工具"和"什么都没说"待遇一样，全靠向量微差
+# （实测 0.04762 vs 0.04545，差 5% = 一个字段都没命中）。用户明明点名 XDN，第一名却是
+# comfyui-ops —— 因为 comfyui 的描述里提到"代理调度 XDN/XDB"。
+# 做法：query 里出现表里这些 token → 对应技能直接置顶（只改排序，不改分数、不动名片）。
+# 🔴 只收**英文/数字工具名**，绝不收中文语义词：「出图/生图」保留向量排序，因为写提示词
+#    才是第一步（老大 2026-10-31 明确：帮我出图，第一步肯定是提示词）。
+SKILL_ALIAS = {
+    "xdn": "xdn-remote-ops", "xdb": "xdn-remote-ops",          # 同一台机器的双系统
+    "comfyui": "comfyui-ops", "8090": "comfyui-ops",
+    "k2": "k2-prompt-engine", "krea2": "k2-prompt-engine",
+    "qw": "qw-image-prompt-engine", "qwen": "qw-image-prompt-engine",
+    "z-image": "zimage-prompt-engine", "zimage": "zimage-prompt-engine",
+    "deeptutor": "deeptutor-ops",
+    "h3": "h3-prompt-writing",                                  # H3 家族总入口
+}
+
+
+def _alias_hits(query):
+    """按 query 里出现的**顺序**返回命中的技能 slug（去重）。"""
+    q = (query or "").lower()
+    seen, out = set(), []
+    for m in re.finditer(r"[a-z][a-z0-9._-]{0,11}|\d{3,5}", q):
+        slug = SKILL_ALIAS.get(m.group(0).strip("._-"))
+        if slug and slug not in seen:
+            seen.add(slug)
+            out.append(slug)
+    return out
+
+
+def _alias_promote(scored, query, cur):
+    """把点名的技能提到第一位；池子里没有就现查库补进来。返回被提权的 slug（没命中返空）。"""
+    for slug in _alias_hits(query):
+        head = "【技能】" + slug + "\n"
+        idx = next((i for i, e in enumerate(scored)
+                    if (e.get("content") or "").startswith(head)), None)
+        # 🔴 家族让位（2026-10-31 实测踩到）：`H3` 同时是 6 个技能的前缀，说「H3」只代表
+        #    "这个家族"。原样置顶会把「H3 擦边单图首帧」「H3 动漫PV」全推成 h3-prompt-writing，
+        #    比不加别名更差。规则：同家族里已有别的技能中文命中更多 → 说明用户问的是那个
+        #    细分场景，别名让位（zh_hit 打平则不动，尊重显式点名）。
+        #    ⚠️ 判断必须放在 idx 之前：目标常常压根不在 top_k 结果里（idx is None），
+        #       旧写法只挡了"已在列表"的情况，实测两次都漏。
+        pref = "【技能】" + slug.split("-")[0] + "-"
+        cur_hit = scored[idx].get("zh_hit", 0) if idx is not None else 0
+        rival = max((e.get("zh_hit", 0) for e in scored
+                     if (e.get("content") or "").startswith(pref)
+                     and not (e.get("content") or "").startswith(head)), default=0)
+        if rival > cur_hit:
+            # 让位 ≠ 放弃：把家族里**最精确的那个**提上来。否则「H3 打戏分镜」会让
+            # 静态分镜图 img-storyboard-fight（不在 h3 家族）抢第一，仍然错。
+            best = max(((e.get("zh_hit", 0), i) for i, e in enumerate(scored)
+                        if (e.get("content") or "").startswith(pref)), default=None)
+            if not best or best[0] <= 0:
+                continue
+            i = best[1]
+            if i:
+                scored.insert(0, scored.pop(i))
+            return (scored[0].get("content") or "").split("\n")[0].replace("【技能】", "").strip()
+        if idx is None:
+            cur.execute("""SELECT id, layer, category, source, content, tags, pinned, created_at
+                           FROM memory_entries WHERE category='uskill_idx' AND content LIKE %s
+                             AND superseded_by IS NULL ORDER BY created_at DESC LIMIT 1""",
+                        ("【技能】" + slug + "\n%",))
+            r = cur.fetchone()
+            if not r:
+                continue
+            scored.insert(0, {"id": str(r[0]), "layer": r[1], "category": r[2], "source": r[3],
+                              "content": r[4][:1500], "tags": r[5], "pinned": r[6],
+                              "created_at": r[7].isoformat(), "score": 0.0, "zh_hit": 0})
+            return slug
+        if idx:
+            scored.insert(0, scored.pop(idx))
+        return slug
+    return ""
 
 
 def _card_parts(content):
@@ -1667,7 +1745,9 @@ def _skill_triggers(desc):
     m = re.search(r"触发词[:：]([^。\n]+)", desc)
     if not m:
         return []
-    return [t.strip() for t in re.split(r"[、,，/]", m.group(1)) if t.strip()][:12]
+    # 分隔符只认「、」「,」「，」：斜杠会把 `taskkill /T` 这类命令行参数切成两半（实测只有
+    # win-dotnet-self-updater 用它，全局无技能依赖斜杠分隔），故不收 `/`
+    return [t.strip() for t in re.split(r"[、,，]", m.group(1)) if t.strip()][:12]
 
 
 def _batch_insert(items):
@@ -1726,6 +1806,33 @@ def cmd_import_batch(a):
     r = _batch_insert(items)
     r["ok"] = True; r["total"] = len(items)
     out(r)
+
+
+def _skill_refresh_card_tags(metas):
+    """同名技能「内容没变」时的派生字段刷新。
+
+    🔴 根因（2026-10-31）：`_batch_insert` 按 (source, content_hash) 预筛 + ON CONFLICT DO NOTHING，
+    正文没改的名片会被**整条跳过**——于是 tags 这类派生字段永远停在当初写入时的样子。
+    早期 `_skill_triggers` 贪婪正则把原描述整段塞进 tags，修好正则后「重注册」却因 hash 相同
+    全部 skipped，脏 tags 一条都刷不掉（实测 24 个技能 inserted=0 / duplicate=0）。
+    这里按 slug 定位现有名片，tags 不一致就原地更新；content 未变，embedding 无需重算。
+    """
+    want = {m["slug"]: ["技能名片", m["slug"]] + list(m["tags"]) for m in metas}
+    conn = connect(); cur = conn.cursor()
+    n = 0
+    for slug, tags in want.items():
+        like = "【技能】" + slug + "\n%"
+        cur.execute("""SELECT id, tags FROM memory_entries WHERE category=%s AND content LIKE %s
+                       AND superseded_by IS NULL ORDER BY created_at DESC LIMIT 1""",
+                    (USKILL_IDX, like))
+        row = cur.fetchone()
+        if not row:
+            continue
+        if list(row[1] or []) != tags:
+            cur.execute("UPDATE memory_entries SET tags=%s WHERE id=%s", (tags, row[0]))
+            n += 1
+    conn.commit(); cur.close(); conn.close()
+    return n
 
 
 def cmd_register_skill(a):
@@ -1819,11 +1926,12 @@ def cmd_register_skill(a):
                         (USKILL_IDX, like, row[0]))
             m["old_card_removed"] = cur.rowcount
     conn.commit(); cur.close(); conn.close()
+    tags_refreshed = _skill_refresh_card_tags(metas)
     try:
         gate_consume_skill_ticket(agent)
     except Exception:
         pass
-    out({"ok": True,
+    out({"ok": True, "tags_refreshed": tags_refreshed,
          "skills": [{"slug": m["slug"], "doc_id": m["docid"], "card_len": len(m["card"]),
                      "old_doc_removed": m.get("old_doc_removed", 0),
                      "old_card_removed": m.get("old_card_removed", 0)} for m in metas],
