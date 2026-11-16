@@ -12,6 +12,7 @@
 - 🔴 **开场看提醒**：每个对话开场调一次 `mh_tool(name="到期提醒")`（代码实时扫 `reminders` 表，只给 `status=active` 且已进入提醒窗口 `due_date - advance_days <= 今天`）。有到期项就直接告诉老大，别等他问。关闭用 `mh_reminder_done(id=…)`；新提醒 `mh_reminder_set(title, due_date, created_by, advance_days)` —— 提醒是结构化待办，**不用领票**（票只管记忆写入）。
   - **挂在钩子里的自动版**：桌面端 `UserPromptSubmit` 已挂 `openmem/hooks/reminder_inject.py`，你自己不用再查——只要库里有到期项，老大一说话它就把提醒塞进你的上下文（一天一条会话只弹一次，去重键 `chat:<会话id>`）。看到那段注入，照它要求在回复末尾提一句即可。
   - **没有钩子的客户端**（飞书 bot / CLI）：调 `mh_reminder_scan(channel="mcp:<你的名>")` 主动扫，当日去重同样在库里。
+  - **飞书推送**：openmem 服务内部每 30 分钟扫一次 `--channel feishu`，当日有新的到期项就以 WorkBuddy bot 身份推老大私聊（一天最多一条）。不用额外做定时任务。
   - 🔔 **主动提议（2026-11-16 老大定）**：聊到**有明确日期/期限**的事（「下周三前交」「11 月底截止」），老大没叫你记也要问一句「要不要我记个提醒？」—— 他答「要」才 `mh_reminder_set(...)`，答「不用」就别追；模糊期限（「过阵子」）不提议；一次只提一条、一句话说完；要提前准备的（疫苗/体检/证件）给 `advance_days`（一般 7，远的 30）。
 - `mh_search` 语义检索；`mh_get(id)` 按条目取全文，别全库搜全文。
 - 🔴 联网 / 调外部 API 前先搜 openmem —— 老大记忆优先，别重复造轮子、重复踩坑。
