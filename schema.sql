@@ -65,3 +65,31 @@ CREATE TABLE IF NOT EXISTS app_config (
   value      jsonb NOT NULL,
   updated_at timestamptz DEFAULT now()
 );
+
+-- 提醒表（2026-11-16）：跨 agent 共享的结构化待办，与记忆池分池（不进检索、不参与查重）
+-- 用法：mh_reminder_set 记 → mh_tool("到期提醒") 查（status=active 且 due_date<=今天）→ mh_reminder_done 关
+CREATE TABLE IF NOT EXISTS reminders (
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  title        text NOT NULL,
+  detail       text,
+  due_date     date NOT NULL,
+  repeat       text CHECK (repeat IN ('once','weekly','monthly','yearly')),
+  status       text NOT NULL DEFAULT 'active' CHECK (status IN ('active','done','cancelled')),
+  created_by   text NOT NULL,                    -- 建这条的 agent 名
+  created_at   timestamptz DEFAULT now(),
+  done_at      timestamptz,
+  advance_days integer NOT NULL DEFAULT 0,       -- 提前多少天开始提醒（0=到期当天）
+  parent_id    uuid REFERENCES reminders(id)     -- repeat 自动排出的下一期指回上一条
+);
+CREATE INDEX IF NOT EXISTS reminders_status_due_idx ON reminders(status, due_date);
+
+-- 已通知台账：UNIQUE(提醒, 通道, 日期) → 同一天同一通道同一条只响一次（2026-11-16）
+CREATE TABLE IF NOT EXISTS reminder_notices (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  reminder_id uuid NOT NULL,
+  channel     text NOT NULL,                     -- chat:<会话> / mcp:<agent> / feishu
+  agent       text,
+  notice_date date NOT NULL,
+  created_at  timestamptz DEFAULT now(),
+  UNIQUE(reminder_id, channel, notice_date)
+);

@@ -1262,6 +1262,271 @@ def cmd_service(a):
     out({"ok": True, "name": name, "exact": exact, "count": len(res), "records": res})
 
 
+# ── 提醒（reminders，2026-11-16 老大要求）─────────────────────────────
+# 为什么单开一张表、不进记忆池：提醒是**结构化待办**（有状态、要关闭、按日期触发），
+# 与「经验记忆」语义检索是两回事 —— 塞进 memory_entries 会被检索污染、也无法按 status 过滤。
+# 任何接入 openmem 的 agent 都能：mh_reminder_set 记 → mh_tool("到期提醒") 查 → mh_reminder_done 关。
+REMINDER_REPEATS = ('once', 'weekly', 'monthly', 'yearly')
+REMINDER_REPEAT_CN = {'once': '一次性', 'weekly': '每周', 'monthly': '每月', 'yearly': '每年'}
+# mh_tool 的别名：agent 说「到期提醒」/「提醒」都能落到同一个代码直出答案
+REMINDER_TOOL_NAMES = {"到期提醒", "到期提醒清单", "提醒"}
+_WEEKDAY_CN = ('周一', '周二', '周三', '周四', '周五', '周六', '周日')
+
+
+def _parse_iso_date(s):
+    """ISO 日期（YYYY-MM-DD，带时间也认前 10 位）→ date；不合法返 None。"""
+    try:
+        return datetime.strptime((s or '').strip()[:10], '%Y-%m-%d').date()
+    except Exception:
+        return None
+
+
+def _rem_dict(r):
+    """列序必须与 _REM_COLS 完全一致（id,title,detail,due_date,repeat,status,
+    created_by,created_at,done_at,advance_days,parent_id）"""
+    return {"id": str(r[0]), "title": r[1], "detail": r[2] or "",
+            "due_date": r[3].isoformat(), "repeat": r[4] or "",
+            "status": r[5], "created_by": r[6],
+            "created_at": r[7].isoformat() if r[7] else None,
+            "done_at": r[8].isoformat() if r[8] else None,
+            "advance_days": r[9] if r[9] is not None else 0,
+            "parent_id": str(r[10]) if r[10] else None}
+
+
+_REM_COLS = ("id, title, detail, due_date, repeat, status, created_by, created_at, "
+             "done_at, advance_days, parent_id")
+
+# 「该提醒了」的判据：已到期 **或** 进入提前提醒窗口（due_date - advance_days <= 今天）
+_DUE_WHERE = "status='active' AND (due_date - advance_days) <= %s"
+
+
+def cmd_reminder_set(a):
+    title = (a.title or '').strip()
+    if not title:
+        out({"ok": False, "error": "title 必填（提醒内容一句话）"}); return
+    due = _parse_iso_date(a.due_date)
+    if not due:
+        out({"ok": False, "error": "due_date 必填且必须是 ISO 日期 YYYY-MM-DD，收到: %r" % a.due_date}); return
+    rep = (getattr(a, "repeat", "") or '').strip().lower() or None
+    if rep and rep not in REMINDER_REPEATS:
+        out({"ok": False, "error": "repeat 只能是 %s，收到: %s" % ('/'.join(REMINDER_REPEATS), rep)}); return
+    by = (getattr(a, "created_by", "") or '').strip() or 'unknown-agent'
+    detail = (getattr(a, "detail", "") or '').strip() or None
+    adv = int(getattr(a, "advance_days", 0) or 0)
+    if adv < 0 or adv > 365:
+        out({"ok": False, "error": "advance_days 只能是 0~365（提前多少天开始提醒）"}); return
+    conn = connect(); cur = conn.cursor()
+    cur.execute("""INSERT INTO reminders (title, detail, due_date, repeat, created_by, advance_days)
+                   VALUES (%s,%s,%s,%s,%s,%s) RETURNING """ + _REM_COLS,
+                (clean_nul(title), clean_nul(detail), due, rep, by, adv))
+    r = cur.fetchone(); conn.commit(); cur.close(); conn.close()
+    out({"ok": True, "id": str(r[0]), "reminder": _rem_dict(r),
+         "today": datetime.now().date().isoformat()})
+
+
+def cmd_reminder_list(a):
+    status = (getattr(a, "status", "") or 'active').strip().lower()
+    sql = "SELECT " + _REM_COLS + " FROM reminders WHERE 1=1"
+    params = []
+    if status and status != 'all':
+        sql += " AND status=%s"; params.append(status)
+    due_before = (getattr(a, "due_before", "") or '').strip()
+    if due_before:
+        d = _parse_iso_date(due_before)
+        if not d:
+            out({"ok": False, "error": "due_before 必须是 ISO 日期 YYYY-MM-DD，收到: %r" % due_before}); return
+        sql += " AND due_date <= %s"; params.append(d)
+    sql += " ORDER BY due_date ASC, created_at ASC"
+    conn = connect(); cur = conn.cursor()
+    cur.execute(sql, params)
+    rows = cur.fetchall(); cur.close(); conn.close()
+    today = datetime.now().date()
+    items = []
+    for r in rows:
+        d = _rem_dict(r)
+        d["days_left"] = (r[3] - today).days
+        items.append(d)
+    out({"ok": True, "today": today.isoformat(), "status": status or 'active',
+         "count": len(items), "reminders": items})
+
+
+def _next_due(due, repeat):
+    """按 repeat 算下一期日期。monthly 走日历安全加法（1/31 → 2/28），不硬加 30 天。"""
+    import calendar
+    if repeat == 'weekly':
+        from datetime import timedelta
+        return due + timedelta(days=7)
+    if repeat == 'yearly':
+        try:
+            return due.replace(year=due.year + 1)
+        except ValueError:           # 2/29 → 2/28
+            return due.replace(year=due.year + 1, day=28)
+    if repeat == 'monthly':
+        y, m = (due.year + 1, 1) if due.month == 12 else (due.year, due.month + 1)
+        return due.replace(year=y, month=m, day=min(due.day, calendar.monthrange(y, m)[1]))
+    return None
+
+
+def cmd_reminder_done(a):
+    """关闭一条提醒：status→done + done_at。id 支持完整 uuid 或 ≥6 位前缀。
+
+    🔴 2026-11-16 老大要求「关闭时按 repeat 自动排下一期」：done 之后如果 repeat
+       是 weekly/monthly/yearly，就**自动建下一条**（同标题/细节/提前量，parent_id 指回来），
+       once 或不带 repeat 则只关闭、不排期。传 --no_next 可强制不排。
+    """
+    raw = (a.id or '').strip().lower()
+    if not raw:
+        out({"ok": False, "error": "id 必填"}); return
+    conn = connect(); cur = conn.cursor()
+    if _UUID_RE.match(raw):
+        cur.execute("SELECT id::text FROM reminders WHERE id=%s::uuid", (raw,))
+    elif re.match(r'^[0-9a-f]{6,32}$', raw):
+        cur.execute("SELECT id::text FROM reminders WHERE id::text LIKE %s LIMIT 2", (raw + '%',))
+    else:
+        cur.close(); conn.close()
+        out({"ok": False, "error": "id 格式不对：完整 36 位 uuid 或 ≥6 位十六进制前缀"}); return
+    ids = [r[0] for r in cur.fetchall()]
+    if not ids:
+        cur.close(); conn.close()
+        out({"ok": False, "error": "提醒不存在: %s" % a.id}); return
+    if len(ids) > 1:
+        cur.close(); conn.close()
+        out({"ok": False, "error": "短 id 有歧义，请加长前缀或用完整 uuid。候选: %s" % ids}); return
+    cur.execute("""UPDATE reminders SET status='done', done_at=now()
+                   WHERE id=%s::uuid RETURNING """ + _REM_COLS, (ids[0],))
+    r = cur.fetchone()
+    done = _rem_dict(r)
+    nxt = None
+    if done["repeat"] in ('weekly', 'monthly', 'yearly') and not getattr(a, "no_next", False):
+        nd = _next_due(r[3], done["repeat"])
+        if nd:
+            cur.execute("""INSERT INTO reminders (title, detail, due_date, repeat, created_by,
+                                                  advance_days, parent_id)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING """ + _REM_COLS,
+                        (r[1], r[2], nd, done["repeat"], r[6], r[9], r[0]))
+            nxt = _rem_dict(cur.fetchone())
+    conn.commit(); cur.close(); conn.close()
+    res = {"ok": True, "id": done["id"], "reminder": done, "note": "已关闭（status=done）"}
+    if nxt:
+        res["next"] = nxt
+        res["note"] = "已关闭；按 repeat=%s 自动排下一期 %s（id %s）" % (nxt["repeat"], nxt["due_date"], nxt["id"])
+    out(res)
+
+
+def build_reminder_digest(advance_all=False):
+    """「到期提醒」成品答案：已到期 **或** 进入提前提醒窗口的 active 条目。
+
+    🔴 2026-11-16 定为**代码直出**（同「技能库总表」的做法），不进 preset_tools：
+        preset_tools 是「LLM 生成 → 落库缓存」，而 LLM 看不到 reminders 表，
+        生成的必然是编出来的假提醒；这条每天会被 agent 开场查一次，宁可不缓存也要真。
+        返回 (正文, 条数, 明细列表)
+    判据 = due_date - advance_days <= 今天（advance_days=0 即到期当天才提醒）。
+    """
+    today = datetime.now().date()
+    conn = connect(); cur = conn.cursor()
+    cur.execute("SELECT " + _REM_COLS + " FROM reminders WHERE " + _DUE_WHERE +
+                " ORDER BY due_date ASC, created_at ASC", (today,))
+    rows = cur.fetchall(); cur.close(); conn.close()
+    head = "到期提醒（%s %s）" % (today.isoformat(), _WEEKDAY_CN[today.weekday()])
+    if not rows:
+        return (head + "：今天没有要提醒的事（active 0 条）。\n"
+                "提示：任何对话开场 mh_tool(\"到期提醒\") 即可自查；"
+                "新提醒用 mh_reminder_set(title, due_date, created_by)。", 0, [])
+    items, lines = [], []
+    for i, r in enumerate(rows, 1):
+        d = _rem_dict(r)
+        left = (r[3] - today).days
+        d["days_left"] = left
+        items.append(d)
+        when = ("逾期 %d 天" % -left) if left < 0 else ("今天到期" if left == 0 else "还有 %d 天" % left)
+        rep = ("｜" + REMINDER_REPEAT_CN.get(d["repeat"], d["repeat"])) if d["repeat"] else ""
+        lines.append("%d. [%s] %s ｜ %s（%s）%s｜ 建: %s"
+                     % (i, d["id"], d["title"], d["due_date"], when, rep, d["created_by"]))
+        if d["detail"]:
+            lines.append("   细节：" + d["detail"].replace("\n", " ")[:300])
+    tail = ('关闭用 mh_reminder_done(id="…")（有 repeat 的会自动排下一期）；'
+            '查全部（含未到提醒窗口的）用 mh_reminder_list(status="active")。')
+    return (head + " 共 %d 条\n%s\n%s" % (len(rows), "\n".join(lines), tail), len(rows), items)
+
+
+def _notices_new(cur, ids, channel, today, agent=None):
+    """把「今天这条已通知过」写进 reminder_notices，返回**本次新通知**的 id 集合。
+    UNIQUE(reminder_id, channel, notice_date) → 同一天同一通道同一条只响一次，不刷屏。"""
+    fresh = set()
+    for rid in ids:
+        cur.execute("""INSERT INTO reminder_notices (reminder_id, channel, agent, notice_date)
+                       VALUES (%s::uuid,%s,%s,%s)
+                       ON CONFLICT (reminder_id, channel, notice_date) DO NOTHING
+                       RETURNING id""", (rid, channel, agent, today))
+        if cur.fetchone():
+            fresh.add(rid)
+    return fresh
+
+
+def cmd_reminder_scan(a):
+    """到期扫描（后台/钩子用，不是给人调的）：找出「该提醒了」且今天还没通知过的条目。
+
+    --channel chat   → 供 UserPromptSubmit 钩子把提醒塞进任何 agent 的对话上下文（只写 notice 表）
+    --channel feishu → 先写 notice，再走 lark 私聊推老大（复用 scripts/lark_bot_send.py，不动 agents-to-feishu）
+    --dry           → 只算不写（自检用）
+    """
+    channel = (getattr(a, "channel", "") or 'chat').strip()
+    agent = (getattr(a, "agent", "") or '').strip() or 'openmem-reminder'
+    today = datetime.now().date()
+    conn = connect(); cur = conn.cursor()
+    cur.execute("SELECT " + _REM_COLS + " FROM reminders WHERE " + _DUE_WHERE +
+                " ORDER BY due_date ASC, created_at ASC", (today,))
+    rows = cur.fetchall()
+    due = [_rem_dict(r) for r in rows]
+    for d, r in zip(due, rows):
+        d["days_left"] = (r[3] - today).days
+    if not due:
+        cur.close(); conn.close()
+        out({"ok": True, "channel": channel, "today": today.isoformat(), "count": 0,
+             "fresh": [], "text": "", "note": "今天没有要提醒的事"})
+        return
+    if getattr(a, "dry", False):
+        cur.close(); conn.close()
+        out({"ok": True, "channel": channel, "today": today.isoformat(),
+             "count": len(due), "dry": True, "due": due})
+        return
+    fresh_ids = _notices_new(cur, [d["id"] for d in due], channel, today, agent)
+    conn.commit(); cur.close(); conn.close()
+    fresh = [d for d in due if d["id"] in fresh_ids]
+    lines = []
+    for d in due:
+        left = d["days_left"]
+        when = ("已逾期 %d 天" % -left) if left < 0 else ("今天到期" if left == 0 else "%d 天后" % left)
+        lines.append("· %s —— %s（%s）" % (d["title"], d["due_date"], when))
+    text = "【openmem 到期提醒】%s\n%s" % (today.isoformat(), "\n".join(lines))
+    res = {"ok": True, "channel": channel, "today": today.isoformat(), "count": len(due),
+           "fresh_count": len(fresh), "fresh": fresh, "due": due, "text": text}
+    if channel.startswith('feishu') and fresh:
+        res["push"] = _push_feishu(text + '\n\n回复「收到」即关闭；要留着的忽略即可。')
+    out(res)
+
+
+def _push_feishu(text):
+    """走 scripts/lark_bot_send.py 以 WorkBuddy bot 身份推老大私聊（复用现成通道，不改它）。"""
+    import subprocess
+    sender = r"C:/D/opt/scripts/lark_bot_send.py"
+    if not os.path.isfile(sender):
+        return {"ok": False, "error": "发送脚本不存在: %s" % sender}
+    try:
+        p = subprocess.run([sys.executable, sender, text], capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=60)
+        return {"ok": p.returncode == 0, "out": (p.stdout or '').strip()[:400],
+                "err": (p.stderr or '').strip()[:300] or None}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cmd_reminder_digest(a):
+    txt, n, items = build_reminder_digest()
+    out({"ok": True, "name": "到期提醒", "answer": txt, "cached": False,
+         "from_code": True, "count": n, "reminders": items, "chars": len(txt)})
+
+
 def cmd_get(a):
     conn = connect(); cur = conn.cursor()
     rid, err = resolve_entry_id(cur, a.id)
@@ -1375,11 +1640,11 @@ SKILL_DIR_ALIAS = (
 SKILL_ALIAS = {
     "xdn": "xdn-remote-ops", "xdb": "xdn-remote-ops",          # 同一台机器的双系统
     "comfyui": "comfyui-ops", "8090": "comfyui-ops",
-    "k2": "k2-prompt-engine", "krea2": "k2-prompt-engine",
-    "qw": "qw-image-prompt-engine", "qwen": "qw-image-prompt-engine",
-    "z-image": "zimage-prompt-engine", "zimage": "zimage-prompt-engine",
+    "k2": "img-prompt-engine", "krea2": "img-prompt-engine",
+    "qw": "img-prompt-engine", "qwen": "img-prompt-engine",
+    "z-image": "img-prompt-engine", "zimage": "img-prompt-engine",   # 三引擎 2026-11-06 合并为 img-prompt-engine
     "deeptutor": "deeptutor-ops",
-    "h3": "h3-prompt-writing",                                  # H3 家族总入口
+    "h3": "h3-video",                                           # H3 家族总入口（2026-11-02 七合一）
 }
 
 
@@ -1582,6 +1847,11 @@ def cmd_tool_call(a):
              "from_code": True, "chars": len(ans)})
         return
 
+    # ── 到期提醒（2026-11-16）：同样代码直出，先于 preset_tools 查表 ─────────
+    if _nm in REMINDER_TOOL_NAMES or _nm.lower() in REMINDER_TOOL_NAMES:
+        cmd_reminder_digest(a)
+        return
+
     # ── 领规矩（真源 RULES.md，本地文件直读：不走 AI 生成、不动库）────────────
     # 2026-09-18 老大定：闸门要的是「领规矩」这个动作 —— 规矩是精简准入条文。
     # （MANUAL.md 那份 11491 字符的胖手册**已删**：能塞进技能文件的塞进去，塞不进的一律不留。）
@@ -1677,6 +1947,10 @@ def cmd_tools_list(a):
     # cmd_tool_refresh 当成待刷新项白烧一次生成），在这里追加虚拟条目让 agent 能发现。
     tools.append({"name": "技能库总表",
                   "description": "全部技能：名片是否有效 / 触发词 / 真实目录（代码实时拼，永远最新，无需刷新）",
+                  "answer_updated_at": None, "enabled": True,
+                  "refresh_interval": "realtime（代码直出）"})
+    tools.append({"name": "到期提醒",
+                  "description": "status=active 且已到期（due_date<=今天）的提醒清单，带 id 可 mh_reminder_done 关闭（代码实时扫 reminders 表，无需刷新）",
                   "answer_updated_at": None, "enabled": True,
                   "refresh_interval": "realtime（代码直出）"})
     tools.sort(key=lambda t: t["name"])
@@ -2078,6 +2352,35 @@ def main():
     tr.set_defaults(func=cmd_tool_refresh)
 
     sub.add_parser("tools_list").set_defaults(func=cmd_tools_list)
+
+    # ── 提醒（2026-11-16）────────────────────────────────
+    rset = sub.add_parser("reminder_set", help="新建提醒")
+    rset.add_argument("--title", required=True)
+    rset.add_argument("--due_date", required=True, help="ISO 日期 YYYY-MM-DD")
+    rset.add_argument("--detail", default="")
+    rset.add_argument("--repeat", default="", help="once/weekly/monthly/yearly，可空")
+    rset.add_argument("--advance_days", type=int, default=0, help="提前多少天开始提醒（0=到期当天）")
+    rset.add_argument("--created_by", default="unknown-agent")
+    rset.set_defaults(func=cmd_reminder_set)
+
+    rls = sub.add_parser("reminder_list", help="列出提醒")
+    rls.add_argument("--status", default="active", help="active/done/cancelled/all")
+    rls.add_argument("--due_before", default="", help="ISO 日期，只列该日期及之前到期的")
+    rls.set_defaults(func=cmd_reminder_list)
+
+    rdn = sub.add_parser("reminder_done", help="关闭提醒（status=done）；带 repeat 的自动排下一期")
+    rdn.add_argument("--id", required=True)
+    rdn.add_argument("--no_next", action="store_true", help="不要自动排下一期")
+    rdn.set_defaults(func=cmd_reminder_done)
+
+    rsc = sub.add_parser("reminder_scan", help="到期扫描：该提醒且今天没通知过的条目（chat/session=给对话用 / feishu=推私聊）")
+    rsc.add_argument("--channel", default="chat",
+                     help="通知通道，也是当日去重键：chat / chat:<会话> / mcp:<agent> / feishu")
+    rsc.add_argument("--agent", default="", help="谁在通知（留痕）")
+    rsc.add_argument("--dry", action="store_true", help="只算不写、不推")
+    rsc.set_defaults(func=cmd_reminder_scan)
+
+    sub.add_parser("reminder_digest", help="打印「到期提醒」成品答案（实时扫库）").set_defaults(func=cmd_reminder_digest)
 
     si = sub.add_parser("skills_index", help="打印技能库总表（实时拼，等同 mh_tool 的「技能库总表」）")
     si.set_defaults(func=lambda a: out({"ok": True, "answer": build_skill_table()}))

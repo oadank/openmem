@@ -17,6 +17,7 @@
  *   mh_tool    预生成答案工具：标准化提示词，直接拿最新备好的答案（秒回）
  *   mh_skill   写入规矩（写入闸门第 1 关的准入入口；默认全文，topic= 按节分发，坑表恒附、铁律随写类节附）
  *   mh_tools_list / mh_status
+ *   mh_reminder_set / mh_reminder_list / mh_reminder_done  跨 agent 提醒（reminders 表）
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -144,6 +145,7 @@ function createOpenmemServer() {
       since: z.string().optional().describe('ISO 日期，如 2026-09-01'),
       top_k: z.number().min(1).max(50).default(10),
       include_archived: z.boolean().default(false).describe('含已归档旧版本'),
+      max_chars: z.number().min(0).max(20000).default(400).describe('每条正文最多返回多少字，默认 400（省上下文）；0 = 不截断，要全文优先用 mh_get(id)'),
       requester: z.string().max(100).optional().describe('你自己的 agent 名（留痕治理用，可不填）')
     },
     async (p) => {
@@ -155,6 +157,22 @@ function createOpenmemServer() {
         for (const k of ['layer', 'category', 'source', 'since']) if (p[k]) a.push(`--${k}`, p[k]);
         if (p.include_archived) a.push('--include_archived');
         const res = parseCore(await runCore(a));
+        // 🔴 2026-11-16 老大令「压 token 落实到代码」：每条正文默认截断 400 字。
+        // 以前返回全文，一轮三条约 3–5KB，光记忆查询就吃掉大半上下文。
+        // 要全文：传 max_chars=0，或用 mh_get(id) 单条取。
+        {
+          const mc = Number(p.max_chars === undefined ? 400 : p.max_chars) || 0;
+          const rows = (res && (res.results || res.entries)) || [];
+          if (mc > 0) {
+            for (const r0 of rows) {
+              const c = String((r0 && r0.content) || '');
+              if (c.length > mc) {
+                r0.content = c.slice(0, mc) + `…（已截 ${c.length} 字 → 前 ${mc} 字，全文用 mh_get(id=${r0.id})）`;
+                r0.truncated = true;
+              }
+            }
+          }
+        }
         try {
           const r = (res && res.results) || (res && res.entries) || [];
           const top = r[0];
@@ -173,6 +191,68 @@ function createOpenmemServer() {
         if (p.name) a.push('--name', p.name);
         return J(parseCore(await runCore(a)));
       } catch (e) { return T(`查服务台账失败: ${e.message}`, true); }
+    });
+
+  s.tool('mh_reminder_set', '【提醒·新建】把一条「到日子要做的事」记进 openmem 的 reminders 表（与记忆池分池，不参与检索/查重）。之后任何接入 openmem 的 agent（reasonix/claude/codex/workbuddy/dsh…）开场调 mh_tool("到期提醒") 就能看到它，老大确认后 mh_reminder_done(id) 关闭。🔴 提醒是结构化待办，改它不用领 mh_skill 票（票是防记忆重复条目，与待办无关）。',
+    {
+      title: z.string().min(1).max(300).describe('提醒内容一句话，必填'),
+      due_date: z.string().min(8).max(32).describe('到期日，ISO 日期 YYYY-MM-DD（必填）'),
+      detail: z.string().max(4000).optional().describe('补充说明（可选）'),
+      repeat: z.enum(['once', 'weekly', 'monthly', 'yearly']).optional().describe('重复方式，可空=一次性；done 时带 repeat 会自动排下一期'),
+      advance_days: z.number().int().min(0).max(365).default(0).describe('提前多少天开始提醒（0=到期当天；疫苗这种想提前一周就传 7）'),
+      created_by: z.string().max(100).optional().describe('建这条的 agent 名（如 reasonix / workbuddy）')
+    },
+    async (p) => {
+      try {
+        const a = ['reminder_set', '--title', p.title, '--due_date', p.due_date,
+          '--created_by', p.created_by || 'unknown-agent'];
+        if (p.detail) a.push('--detail', p.detail);
+        if (p.repeat) a.push('--repeat', p.repeat);
+        if (p.advance_days) a.push('--advance_days', String(p.advance_days));
+        return J(parseCore(await runCore(a, 60000)));
+      } catch (e) { return T(`建提醒失败: ${e.message}`, true); }
+    });
+
+  s.tool('mh_reminder_list', '【提醒·列表】按状态查提醒（默认只看 active），带 days_left（负数=已逾期）。查「有什么待办/提醒/要办的事」用这个；只看已到期的成品答案用 mh_tool("到期提醒")。',
+    {
+      status: z.enum(['active', 'done', 'cancelled', 'all']).default('active').describe('默认 active；all=全部'),
+      due_before: z.string().max(32).optional().describe('只列该日期（YYYY-MM-DD）及之前到期的')
+    },
+    async (p) => {
+      try {
+        const a = ['reminder_list', '--status', p.status || 'active'];
+        if (p.due_before) a.push('--due_before', p.due_before);
+        return J(parseCore(await runCore(a, 60000)));
+      } catch (e) { return T(`查提醒失败: ${e.message}`, true); }
+    });
+
+  s.tool('mh_reminder_done', '【提醒·关闭】老大确认做完了 → status 改 done 并记 done_at。**带 repeat（weekly/monthly/yearly）的会自动排下一期**（同标题/细节/提前量），返回体里的 next 就是新那条；不想要下期传 no_next=true。id 支持完整 uuid 或 ≥6 位前缀。',
+    {
+      id: z.string().min(6).max(64).describe('提醒 id：完整 uuid 或 ≥6 位十六进制前缀'),
+      no_next: z.boolean().default(false).describe('true=只关闭，不按 repeat 排下一期')
+    },
+    async (p) => {
+      try {
+        const a = ['reminder_done', '--id', p.id];
+        if (p.no_next) a.push('--no_next');
+        return J(parseCore(await runCore(a, 60000)));
+      }
+      catch (e) { return T(`关闭提醒失败: ${e.message}`, true); }
+    });
+
+  s.tool('mh_reminder_scan', '【提醒·到期扫描】没有 UserPromptSubmit 钩子的客户端（飞书 bot / CLI）用这个主动扫一次：返回「已到期或进入提前提醒窗口」的提醒，并标记今天已通知过（同一天同一通道同一条只响一次）。channel="chat" 只登记不推送（给自己塞进上下文用）；channel="feishu" 会额外以 WorkBuddy bot 身份推老大飞书私聊。钩子已自动调用，人一般不用调。',
+    {
+      channel: z.string().max(60).default('chat').describe('通知通道，也是当日去重键：chat / mcp:<你的名> / feishu'),
+      agent: z.string().max(100).optional().describe('谁在扫（留痕）'),
+      dry: z.boolean().default(false).describe('只算不写不推，自检用')
+    },
+    async (p) => {
+      try {
+        const a = ['reminder_scan', '--channel', p.channel || 'chat'];
+        if (p.agent) a.push('--agent', p.agent);
+        if (p.dry) a.push('--dry');
+        return J(parseCore(await runCore(a, 90000)));
+      } catch (e) { return T(`扫描失败: ${e.message}`, true); }
     });
 
   s.tool('mh_dupcheck', '【存量重复体检 · 2026-09-25 加】把全库两两比一遍，列出相似度 ≥min 的**条目对**。写入闸门只管新写入，库里已经堆下的重复只能靠它扫。返回每对含双方 id/首行/分数/tier：tier=hard(≥0.88) 基本是同一件事的第二份 → 合并；tier=ask(≥0.855) 必须 mh_get 把两条原文都读完再判；tier=note 只表示"该看一眼"。🔴 铁律：**分数不配当结论** —— 实测 0.9889 的两条可以是两个不同服务的台账（同模板不同实体），0.82 的两条可以是同一件事的两份。判同判异只能读原文。台账族（source=agent-matrix 的 services/capabilities）已自动豁免，不会再来烦你。',
@@ -233,7 +313,7 @@ function createOpenmemServer() {
       } catch (e) { return T(`领规矩失败: ${e.message}`, true); }
     });
 
-  s.tool('mh_tool', '【首选 · 秒回】调用预生成答案工具：标准化提示词 + 后台已备好最新最准的答案，**不走 LLM、几乎零等待**。凡「老大是什么人 / 偏好习惯 / 铁律清单 / 本机环境 / 服务与端口 / 12 bot 花名册 / 项目索引」这类**标准问题一律先用这个**，别用 mh_search 现搜、更别凭印象猜。不知道有哪些成品答案就先调 mh_tools_list（一次看清全部 + 新鲜度）。🔴 其中「技能库总表」是代码实时拼的：技能名 / 触发词 / 真实目录 / 名片是否过期，每次现读、永远最新、无需 force_refresh。⚠️ 写入规矩请用 mh_skill，别在这里领。',
+  s.tool('mh_tool', '【首选 · 秒回】调用预生成答案工具：标准化提示词 + 后台已备好最新最准的答案，**不走 LLM、几乎零等待**。凡「老大是什么人 / 偏好习惯 / 铁律清单 / 本机环境 / 服务与端口 / 12 bot 花名册 / 项目索引」这类**标准问题一律先用这个**，别用 mh_search 现搜、更别凭印象猜。不知道有哪些成品答案就先调 mh_tools_list（一次看清全部 + 新鲜度）。🔴 其中「技能库总表」是代码实时拼的：技能名 / 触发词 / 真实目录 / 名片是否过期，每次现读、永远最新、无需 force_refresh。同样代码直出的还有「到期提醒」= status=active 且已到期的提醒清单（每个对话开场查一次，有到期项主动告诉老大；关闭用 mh_reminder_done）。⚠️ 写入规矩请用 mh_skill，别在这里领。',
     {
       name: z.string().min(1).describe('工具名，如 主人的喜好；另有「技能库总表」= 全部技能的名片是否有效/触发词/真实目录（代码实时拼，永远最新）'),
       agent: z.string().max(100).optional().describe('你自己的 agent 名（如 claude / codex / mimo），选填。'),
@@ -266,8 +346,19 @@ function createOpenmemServer() {
         const capabilities = [
           { tool: 'mh_register_skill', intent: '把某技能加入/注册进 openmem 技能库', triggers: ['把 X 加入技能库', '注册技能', '登记技能', '让 openmem 学会 X 技能', '把某 SKILL.md 收进记忆'], arg: 'file=SKILL.md 绝对路径数组' },
           { tool: 'mh_search', intent: '语义搜记忆/知识/技能名片', triggers: ['查一下 openmem', '有没有相关的...', '我记得...'], arg: 'query + 可选 category' },
-          { tool: 'mh_write', intent: '写入一条记忆/知识', triggers: ['记一下', '把结论存进 openmem'], arg: '需先 mh_skill 领票' }
+          { tool: 'mh_write', intent: '写入一条记忆/知识', triggers: ['记一下', '把结论存进 openmem'], arg: '需先 mh_skill 领票' },
+          { tool: 'mh_tool', intent: '看已到期的提醒（每个对话开场自查一次）', triggers: ['有什么提醒', '到期了没', '今天要办什么', '有没有待办'], arg: 'name="到期提醒"（代码实时扫 reminders 表）' },
+          { tool: 'mh_reminder_set', intent: '记一条「到日子要做的事」当提醒', triggers: ['提醒我', '记个待办', 'X 号要做 Y', '别忘了'], arg: 'title + due_date(YYYY-MM-DD) + created_by' },
+          { tool: 'mh_reminder_list', intent: '按状态查提醒（active/done/all）', triggers: ['提醒清单', '还有哪些没做'], arg: 'status=active' },
+          { tool: 'mh_reminder_done', intent: '老大确认做完了 → 关闭提醒（带 repeat 自动排下一期）', triggers: ['做完了', '收到', '关掉这条提醒'], arg: 'id（uuid 或 ≥6 位前缀）' },
+          { tool: 'mh_reminder_scan', intent: '主动扫一次到期提醒并登记通知（无钩子客户端用）', triggers: ['今天有什么提醒', '扫一下提醒'], arg: 'channel=chat / feishu' }
         ];
+        // 开场自查广播：提醒是「跨 agent 共享的待办」，任何 agent 接上就该主动看一眼
+        const reminder_hint = {
+          rule: '每个对话开场调一次 mh_tool(name="到期提醒")；有到期项就直接告诉老大，别等他问。',
+          close: '老大确认后 mh_reminder_done(id=…) 关闭；新提醒 mh_reminder_set(title, due_date, created_by)。',
+          why: '写在 openmem 层：reasonix / claude / codex / workbuddy / dsh 共用同一张 reminders 表，不需要各自实现扫描。'
+        };
         // 🔴 通用前置闸门：对所有接入 openmem 的 agent 生效，不靠单个人设。WorkBuddy/CodeBuddy 桌面端已用 UserPromptSubmit hook 自动执行，这里再广播一次兜底。
         const skill_gate = {
           rule: '接到任务、动手前，先 mh_search(category="uskill_idx", top_k=3) 查技能库；命中现成技能就照着做，没命中再自己干。',
@@ -275,7 +366,7 @@ function createOpenmemServer() {
           why: '对所有接入 openmem 的 agent（workbuddy/claude/codex/dsh/mimo/codebuddy…）通用，写在 openmem 层，不依赖任何客户端的人设或记忆。',
           hook: 'WorkBuddy/CodeBuddy 桌面端已挂 UserPromptSubmit hook 自动执行此闸门；其他客户端靠本广播 + 各自 SessionStart hook。'
         };
-        return J({ ok: true, ...metrics, capabilities, skill_gate });
+        return J({ ok: true, ...metrics, capabilities, reminder_hint, skill_gate });
       } catch (e) { return T(`失败: ${e.message}`, true); }
     });
 
@@ -403,6 +494,29 @@ function createOpenmemServer() {
   return s;
 }
 
+// ── 提醒每日飞书推送（2026-11-16 老大要求：到日子要主动响，不能只等对话）───────
+// 复用现有保鲜线程的节奏：每 30 分钟扫一次 reminders（mem_core reminder_scan --channel feishu）。
+// 当日去重在 reminder_notices 里管着（UNIQUE(提醒,通道,日期)）→ 实际每天只推一次，扫多了也无害。
+// 推送通道 = scripts/lark_bot_send.py（WorkBuddy bot → 老大私聊），不动 agents-to-feishu。
+function startReminderPush() {
+  const TICK_MS = 30 * 60 * 1000;
+  const run = async () => {
+    try {
+      const raw = await runCore(['reminder_scan', '--channel', 'feishu', '--agent', 'openmem-daily'], 120000);
+      const d = JSON.parse(raw);
+      if (d.count > 0 && d.fresh_count > 0) {
+        console.error(`[openmem] 提醒推送: ${d.fresh_count} 条新到期已推飞书`);
+      }
+    } catch (e) {
+      console.error(`[openmem] 提醒推送失败: ${String(e).slice(0, 200)}`);
+    }
+  };
+  setTimeout(run, 2 * 60 * 1000);   // 启动 2 分钟后先扫一次
+  const timer = setInterval(run, TICK_MS);
+  if (timer.unref) timer.unref();
+  console.error('[openmem] 提醒推送线程已启动（每 30 分钟扫，当日去重=每天最多推一次）');
+}
+
 // 预设工具保鲜（2026-09-11 第一档优化）：后台按 refresh_interval 自动刷新过期缓存，
 // 解决"隔天第一次调用要现场重算、慢十几秒"的问题。只刷过期的，不浪费 LLM 调用。
 function startToolRefresher() {
@@ -423,6 +537,7 @@ function startToolRefresher() {
 
 async function main() {
   startToolRefresher();
+  startReminderPush();
   if (HTTP_PORT) {
     // ===== 有 session 支持（2026-09-30：openclaw 2026.9.7 的 MCP client 要求 initialize 返回
     // Mcp-Session-Id，无状态模式会让它 initialize 永远"未完成"而超时。codex/claude/reasonix
